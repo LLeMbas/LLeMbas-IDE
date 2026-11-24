@@ -1,6 +1,6 @@
 # LLeMbas IDE
 
-LLeMbas in your editor: a Neovim plugin, and a VS Code / VSCodium extension (not written yet).
+LLeMbas in your editor: a Neovim plugin, and a VS Code / VSCodium extension.
 
 Both are clients of the [LLeMbas CLI](https://github.com/LLeMbas/LLeMbas-CLI). The CLI is the agent:
 it holds the sign-in to your LLeMbas server, the models, the tools and the permissions. The editor
@@ -55,9 +55,26 @@ approvals work, and a rewrite is done by the agent on the saved file.
 
 Not there yet: picking an older session, and the agent's questions and plans as cards.
 
+## VS Code and VSCodium
+
+Needs VS Code or VSCodium 1.85 or newer. The extension lives in `vscode/`; it is plain JavaScript
+with no dependencies, and is installed from a package you build with Node alone:
+
+```sh
+scripts/package-vscode.sh                                   # writes dist/llembas-<version>.vsix
+codium --install-extension dist/llembas-<version>.vsix      # or: code --install-extension …
+```
+
+A chat in the side bar, questions about a selection, a selection rewritten as changes you accept or
+reject, autocomplete as you type and on `Alt+\`, the two model settings, and pictures the agent
+shows. Commands, keys, settings and what is not there yet: [`vscode/README.md`](vscode/README.md).
+
 ## Tests
 
 `scripts/test-nvim.sh` runs the plugin headless against a stand-in agent (needs `nvim` and `python3`).
+
+`scripts/test-vscode.sh` runs the extension's parts that need no editor against a stand-in agent of
+its own, and checks the package (needs Node 18 or newer and `python3`). It does not start VS Code.
 
 ## Licence
 

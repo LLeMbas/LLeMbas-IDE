@@ -1,0 +1,135 @@
+{
+  "name": "llembas",
+  "displayName": "LLeMbas",
+  "description": "LLeMbas in your editor: chat with the agent, ask about a selection, have it rewritten as a diff, and autocomplete — a client of the LLeMbas CLI.",
+  "version": "0.0.0",
+  "publisher": "llembas",
+  "license": "MIT",
+  "repository": { "type": "git", "url": "https://github.com/LLeMbas/LLeMbas-IDE" },
+  "engines": { "vscode": "^1.85.0" },
+  "categories": ["Machine Learning", "Other"],
+  "keywords": ["llembas", "agent", "chat", "autocomplete", "acp"],
+  "main": "./extension.js",
+  "extensionKind": ["workspace"],
+  "activationEvents": ["onStartupFinished", "onView:llembas.chat"],
+  "capabilities": {
+    "untrustedWorkspaces": {
+      "supported": false,
+      "description": "LLeMbas starts an agent that works in the open folder; it stays off until you trust the folder."
+    },
+    "virtualWorkspaces": {
+      "supported": false,
+      "description": "The LLeMbas CLI works on files on this computer."
+    }
+  },
+  "contributes": {
+    "viewsContainers": {
+      "activitybar": [{ "id": "llembas", "title": "LLeMbas", "icon": "media/icon.svg" }]
+    },
+    "views": {
+      "llembas": [{ "type": "webview", "id": "llembas.chat", "name": "Chat" }]
+    },
+    "commands": [
+      { "command": "llembas.open", "title": "Open the Chat", "category": "LLeMbas" },
+      { "command": "llembas.newSession", "title": "New Session", "category": "LLeMbas" },
+      { "command": "llembas.stop", "title": "Stop the Running Turn", "category": "LLeMbas" },
+      { "command": "llembas.ask", "title": "Ask About the Selection", "category": "LLeMbas" },
+      { "command": "llembas.rewrite", "title": "Rewrite the Selection", "category": "LLeMbas" },
+      { "command": "llembas.complete", "title": "Suggest a Completion Here", "category": "LLeMbas" },
+      { "command": "llembas.acceptChange", "title": "Accept the Proposed Change at the Cursor", "category": "LLeMbas" },
+      { "command": "llembas.rejectChange", "title": "Reject the Proposed Change at the Cursor", "category": "LLeMbas" },
+      { "command": "llembas.acceptAllChanges", "title": "Accept All Proposed Changes in This File", "category": "LLeMbas" },
+      { "command": "llembas.rejectAllChanges", "title": "Reject All Proposed Changes in This File", "category": "LLeMbas" },
+      { "command": "llembas.showChanges", "title": "Show the Proposed Changes as a Diff", "category": "LLeMbas" },
+      { "command": "llembas.chooseMode", "title": "Choose the Mode", "category": "LLeMbas" },
+      { "command": "llembas.chooseModel", "title": "Choose This Session's Model", "category": "LLeMbas" },
+      { "command": "llembas.modelSettings", "title": "Models (Autocomplete and Main)", "category": "LLeMbas" },
+      { "command": "llembas.chooseAutocompleteModel", "title": "Choose the Autocomplete Model", "category": "LLeMbas" },
+      { "command": "llembas.chooseMainModel", "title": "Choose the Main Model", "category": "LLeMbas" },
+      { "command": "llembas.restart", "title": "Stop the Agent (It Starts Again When Needed)", "category": "LLeMbas" }
+    ],
+    "keybindings": [
+      { "command": "llembas.open", "key": "ctrl+alt+l", "mac": "cmd+alt+l" },
+      { "command": "llembas.ask", "key": "ctrl+alt+k", "mac": "cmd+alt+k", "when": "editorTextFocus && editorHasSelection" },
+      { "command": "llembas.rewrite", "key": "ctrl+alt+e", "mac": "cmd+alt+e", "when": "editorTextFocus && editorHasSelection && !editorReadonly" },
+      { "command": "llembas.complete", "key": "alt+\\", "when": "editorTextFocus && !editorReadonly" },
+      { "command": "llembas.acceptAllChanges", "key": "ctrl+alt+enter", "mac": "cmd+alt+enter", "when": "editorTextFocus && llembas.hasProposal" },
+      { "command": "llembas.rejectAllChanges", "key": "ctrl+alt+backspace", "mac": "cmd+alt+backspace", "when": "editorTextFocus && llembas.hasProposal" }
+    ],
+    "menus": {
+      "editor/context": [
+        { "command": "llembas.ask", "when": "editorHasSelection", "group": "llembas@1" },
+        { "command": "llembas.rewrite", "when": "editorHasSelection && !editorReadonly", "group": "llembas@2" }
+      ],
+      "view/title": [
+        { "command": "llembas.newSession", "when": "view == llembas.chat", "group": "llembas@1" },
+        { "command": "llembas.modelSettings", "when": "view == llembas.chat", "group": "llembas@2" },
+        { "command": "llembas.restart", "when": "view == llembas.chat", "group": "llembas@3" }
+      ],
+      "commandPalette": [
+        { "command": "llembas.acceptChange", "when": "llembas.hasProposal" },
+        { "command": "llembas.rejectChange", "when": "llembas.hasProposal" },
+        { "command": "llembas.acceptAllChanges", "when": "llembas.hasProposal" },
+        { "command": "llembas.rejectAllChanges", "when": "llembas.hasProposal" },
+        { "command": "llembas.showChanges", "when": "llembas.hasProposal" }
+      ]
+    },
+    "configuration": {
+      "title": "LLeMbas",
+      "properties": {
+        "llembas.command": {
+          "type": "string",
+          "default": "lembas",
+          "scope": "machine",
+          "markdownDescription": "The LLeMbas CLI: `lembas` when it is on your `PATH`, or the full path of the program. It is started as `lembas serve --stdio`. This is the only thing set here: the server, the sign-in, the models and the permissions are the CLI's own."
+        },
+        "llembas.chat.sendEditorContext": {
+          "type": "boolean",
+          "default": true,
+          "description": "Tell the agent, with each message you type, which file is in front, where the cursor is, what is selected, and the problems the editor shows there."
+        },
+        "llembas.chat.showThinking": {
+          "type": "boolean",
+          "default": false,
+          "description": "Show the model's thinking in the chat."
+        },
+        "llembas.chat.startMode": {
+          "type": "string",
+          "default": "",
+          "description": "The mode a new session starts in (for example manual, in which every edit is shown as a diff to accept). Empty: the CLI's own."
+        },
+        "llembas.complete.auto": {
+          "type": "boolean",
+          "default": true,
+          "description": "Suggest a completion as you type. Off: only when you ask for one (Alt+\\). It needs an autocomplete model, chosen on the server or with \"LLeMbas: Choose the Autocomplete Model\"."
+        },
+        "llembas.complete.debounce": {
+          "type": "number",
+          "default": 250,
+          "minimum": 0,
+          "maximum": 5000,
+          "description": "How long you must pause, in milliseconds, before a completion is asked for."
+        },
+        "llembas.complete.maxTokens": {
+          "type": "number",
+          "default": 0,
+          "minimum": 0,
+          "maximum": 512,
+          "description": "The longest completion to ask for, in tokens. 0: the server's own number."
+        },
+        "llembas.rewrite.openDiff": {
+          "type": "boolean",
+          "default": true,
+          "description": "Open the diff view beside the file when a rewrite is proposed. Off: only the marks and the Accept / Reject lines in the file."
+        },
+        "llembas.media.maxMegabytes": {
+          "type": "number",
+          "default": 64,
+          "minimum": 1,
+          "maximum": 64,
+          "description": "The largest file, in megabytes, the chat takes from the agent to show (a picture) or to open. A larger one is refused, and the agent is told why."
+        }
+      }
+    }
+  }
+}

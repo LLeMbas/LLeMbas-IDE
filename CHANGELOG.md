@@ -30,3 +30,24 @@
 ### Fixed (Neovim)
 
 - Starting a new session could leave the plugin believing the new agent had stopped.
+
+### VS Code / VSCodium extension
+
+- First version, in `vscode/`: a client of `lembas serve --stdio`, like the Neovim plugin. Plain
+  JavaScript with no dependencies and no build; `scripts/package-vscode.sh` writes the `.vsix`.
+- A chat in the side bar: the transcript, the session's mode and model, Stop, and a new session.
+  The CLI's approval cards are answered there; one that carries an edit opens the change in the
+  editor's diff view before you answer, and nothing is written until you allow it.
+- Ask about a selection: the file, the lines, the selected text as the editor has it and the
+  problems shown there go with the question; a typed message carries the file in front.
+- Rewrite a selection: the result is proposed in the file as changes to accept or reject, one by
+  one or all at once, and as a diff beside it. Nothing is written before you accept.
+- Autocomplete as inline suggestions, as you type and on `Alt+\`. Without an autocomplete model
+  it says so once, with a button to choose one.
+- The two model settings, autocomplete and main: saved in your account, or switched for one
+  window only.
+- A picture the agent shows appears in the chat; any other file is a line with Open. Files of
+  more than 64 MB are refused.
+- The agent reads a file you have open as the editor has it, saved or not.
+- What a model writes is drawn as text through the extension's own small Markdown reader: HTML in
+  a reply stays text, and only `http`, `https` and `mailto` links open.

@@ -1,0 +1,204 @@
+/* Every colour is one of the editor's theme variables. */
+html, body { height: 100%; }
+body {
+  margin: 0;
+  padding: 0;
+  display: grid;
+  grid-template-rows: auto minmax(0, 1fr) auto;
+  color: var(--vscode-foreground);
+  background: var(--vscode-sideBar-background);
+  font-family: var(--vscode-font-family);
+  font-size: var(--vscode-font-size);
+  line-height: 1.45;
+}
+* { box-sizing: border-box; }
+
+.bar {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr) auto;
+  gap: 6px;
+  padding: 6px 8px;
+  border-bottom: 1px solid var(--vscode-panel-border);
+}
+select, button, textarea { font: inherit; }
+select {
+  width: 100%;
+  height: 26px;
+  color: var(--vscode-dropdown-foreground);
+  background: var(--vscode-dropdown-background);
+  border: 1px solid var(--vscode-dropdown-border);
+  border-radius: 2px;
+}
+button {
+  height: 26px;
+  padding: 0 10px;
+  color: var(--vscode-button-foreground);
+  background: var(--vscode-button-background);
+  border: 1px solid var(--vscode-button-border, transparent);
+  border-radius: 2px;
+  cursor: pointer;
+  white-space: nowrap;
+}
+button:hover { background: var(--vscode-button-hoverBackground); }
+button.second {
+  color: var(--vscode-button-secondaryForeground);
+  background: var(--vscode-button-secondaryBackground);
+}
+button.second:hover { background: var(--vscode-button-secondaryHoverBackground); }
+button.plain {
+  width: 22px;
+  height: 22px;
+  padding: 0;
+  color: var(--vscode-foreground);
+  background: transparent;
+  border-color: transparent;
+}
+button.plain:hover { background: var(--vscode-toolbar-hoverBackground); }
+button:disabled, select:disabled { opacity: 0.6; cursor: default; }
+select:focus, button:focus-visible, textarea:focus, .link:focus-visible {
+  outline: 1px solid var(--vscode-focusBorder);
+  outline-offset: -1px;
+}
+
+#log {
+  overflow-y: auto;
+  overflow-x: hidden;
+  padding: 8px;
+}
+.item { margin: 0 0 10px; overflow-wrap: anywhere; }
+.who {
+  margin: 0 0 2px;
+  font-size: 0.85em;
+  font-weight: 600;
+  color: var(--vscode-descriptionForeground);
+}
+.user .text, .thought .text, .note { white-space: pre-wrap; }
+.user .body {
+  padding: 6px 8px;
+  background: var(--vscode-input-background);
+  border: 1px solid var(--vscode-input-border, var(--vscode-panel-border));
+  border-radius: 3px;
+}
+.label { font-size: 0.85em; color: var(--vscode-descriptionForeground); }
+.thought .text { color: var(--vscode-descriptionForeground); font-style: italic; }
+.note { color: var(--vscode-descriptionForeground); font-size: 0.92em; }
+.tool, .plan {
+  display: grid;
+  grid-template-columns: 1.4em minmax(0, 1fr);
+  color: var(--vscode-descriptionForeground);
+  font-size: 0.92em;
+}
+.tool.failed .mark { color: var(--vscode-errorForeground); }
+.tool .files { grid-column: 2; }
+
+.md p, .md ul, .md ol, .md pre, .md blockquote, .md h1, .md h2, .md h3, .md h4, .md h5, .md h6 { margin: 0 0 8px; }
+.md > :last-child { margin-bottom: 0; }
+.md h1, .md h2, .md h3, .md h4, .md h5, .md h6 { font-size: 1em; font-weight: 600; }
+.md h1 { font-size: 1.2em; }
+.md h2 { font-size: 1.1em; }
+.md ul, .md ol { padding-left: 1.5em; }
+.md li.depth-1 { margin-left: 1.2em; }
+.md li.depth-2 { margin-left: 2.4em; }
+.md li.depth-3 { margin-left: 3.6em; }
+.md li.depth-4 { margin-left: 4.8em; }
+.md li.depth-5 { margin-left: 6em; }
+.md blockquote {
+  padding: 0 0 0 8px;
+  border-left: 3px solid var(--vscode-textBlockQuote-border);
+  background: var(--vscode-textBlockQuote-background);
+}
+.md hr { border: 0; border-top: 1px solid var(--vscode-panel-border); margin: 8px 0; }
+code, pre {
+  font-family: var(--vscode-editor-font-family);
+  font-size: var(--vscode-editor-font-size);
+}
+.md code { background: var(--vscode-textCodeBlock-background); padding: 0 3px; border-radius: 2px; }
+pre {
+  margin: 0;
+  padding: 6px 8px;
+  overflow-x: auto; /* a wide line scrolls here, never the view */
+  white-space: pre;
+  background: var(--vscode-textCodeBlock-background);
+  border-radius: 3px;
+}
+.md pre code { background: transparent; padding: 0; }
+.link {
+  color: var(--vscode-textLink-foreground);
+  text-decoration: underline;
+  cursor: pointer;
+}
+.link:hover { color: var(--vscode-textLink-activeForeground); }
+
+.card {
+  padding: 8px;
+  border: 1px solid var(--vscode-inputValidation-warningBorder, var(--vscode-panel-border));
+  background: var(--vscode-inputValidation-warningBackground, var(--vscode-input-background));
+  border-radius: 3px;
+}
+.card.closed {
+  border-color: var(--vscode-panel-border);
+  background: transparent;
+  color: var(--vscode-descriptionForeground);
+}
+.card .title { white-space: pre-wrap; font-family: var(--vscode-editor-font-family); margin: 2px 0 4px; }
+.card .reason { font-size: 0.92em; margin: 0 0 6px; }
+.card pre { margin: 0 0 6px; max-height: 16em; overflow: auto; }
+.card .buttons { display: flex; flex-wrap: wrap; gap: 6px; }
+
+.media img {
+  display: block;
+  max-width: 100%;
+  max-height: 60vh;
+  height: auto;
+  border: 1px solid var(--vscode-panel-border);
+  border-radius: 3px;
+  cursor: pointer;
+}
+.media .caption {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 6px;
+  align-items: center;
+  min-height: 26px;
+  margin-top: 4px;
+  font-size: 0.92em;
+  color: var(--vscode-descriptionForeground);
+}
+.media .name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+footer { padding: 6px 8px 8px; border-top: 1px solid var(--vscode-panel-border); }
+textarea {
+  display: block;
+  width: 100%;
+  height: 5.2em;
+  resize: none;
+  padding: 5px 6px;
+  color: var(--vscode-input-foreground);
+  background: var(--vscode-input-background);
+  border: 1px solid var(--vscode-input-border, var(--vscode-panel-border));
+  border-radius: 2px;
+}
+textarea::placeholder { color: var(--vscode-input-placeholderForeground); }
+.send {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto auto;
+  gap: 6px;
+  align-items: center;
+  height: 26px;
+  margin-top: 6px;
+}
+.attached {
+  grid-column: 1;
+  display: grid;
+  grid-template-columns: minmax(0, auto) 22px;
+  gap: 2px;
+  align-items: center;
+  justify-content: start;
+  height: 26px;
+  font-size: 0.92em;
+  color: var(--vscode-descriptionForeground);
+}
+.attached-label { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.working { grid-column: 2; font-size: 0.92em; color: var(--vscode-descriptionForeground); }
+#send { grid-column: 3; }
+[hidden] { display: none !important; }
