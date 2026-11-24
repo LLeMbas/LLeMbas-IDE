@@ -81,6 +81,8 @@ class TextDocument {
     this.version = 1;
     this.eol = 1;
     this.isClosed = false;
+    this.isDirty = false;
+    this.saves = 0;
     this.text = text;
   }
   get lines() {
@@ -103,6 +105,13 @@ class TextDocument {
   positionAt(offset) {
     const before = this.text.slice(0, Math.max(0, Math.min(offset, this.text.length))).split('\n');
     return new Position(before.length - 1, before[before.length - 1].length);
+  }
+  async save() {
+    if (this.uri.scheme !== 'file') return false;
+    require('node:fs').writeFileSync(this.uri.fsPath, this.text);
+    this.isDirty = false;
+    this.saves += 1;
+    return true;
   }
   getText(range) {
     return range ? this.text.slice(this.offsetAt(range.start), this.offsetAt(range.end)) : this.text;
@@ -243,7 +252,12 @@ function make(pkg) {
       onDidChangeConfiguration: state.configured.event,
       asRelativePath: (uri) => path.basename(uri.path),
       openTextDocument: async (what) => {
-        const doc = what instanceof Uri ? new TextDocument(what, require('node:fs').readFileSync(what.fsPath, 'utf8')) : new TextDocument(new Uri('untitled', 'Untitled-1'), what.content);
+        let doc;
+        if (!(what instanceof Uri)) {
+          doc = new TextDocument(new Uri('untitled', 'Untitled-1'), what.content);
+          doc.isDirty = true; // as the editor has it: a document made from content wants saving
+        } else if (what.scheme === 'file') doc = new TextDocument(what, require('node:fs').readFileSync(what.fsPath, 'utf8'));
+        else doc = new TextDocument(what, await state.contentProviders.get(what.scheme).provideTextDocumentContent(what));
         api.workspace.textDocuments.push(doc);
         return doc;
       },
@@ -261,6 +275,7 @@ function make(pkg) {
           for (let i = 1; i < edits.length; i++) if (edits[i].to > edits[i - 1].from) throw new Error('overlapping edits');
           for (const e of edits) doc.text = doc.text.slice(0, e.from) + e.text + doc.text.slice(e.to);
           doc.version += 1;
+          doc.isDirty = true;
           state.changed.fire({ document: doc, contentChanges: edits.map((e) => ({ range: e.range, text: e.text })) });
         }
         return true;

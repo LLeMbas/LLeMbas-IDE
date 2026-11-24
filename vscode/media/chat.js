@@ -56,6 +56,9 @@
       } else if (b.t === 'pre') {
         e = doc.createElement('pre');
         e.appendChild(el(doc, 'code', '', b.v));
+      } else if (b.t === 'plain') {
+        // A text too long to be read as Markdown: shown as it was written.
+        e = el(doc, 'div', 'plain', b.v);
       } else if (b.t === 'hr') {
         e = doc.createElement('hr');
       } else if (b.t === 'quote') {
@@ -162,7 +165,7 @@
       }
       var cap = el(doc, 'div', 'caption');
       cap.appendChild(el(doc, 'span', 'name', String(item.name) + (item.sizeWords ? ' (' + item.sizeWords + ')' : '')));
-      cap.appendChild(button(doc, 'Open', 'second', function () {
+      cap.appendChild(button(doc, item.opens ? 'Open' : 'Show in folder', 'second', function () {
         post({ type: 'openMedia', key: item.key });
       }));
       root.appendChild(cap);

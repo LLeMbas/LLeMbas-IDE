@@ -97,7 +97,8 @@
         "llembas.chat.startMode": {
           "type": "string",
           "default": "",
-          "description": "The mode a new session starts in (for example manual, in which every edit is shown as a diff to accept). Empty: the CLI's own."
+          "scope": "machine",
+          "description": "The mode a new session starts in (for example manual, in which every edit is shown as a diff to accept). Empty: the CLI's own. Set for the machine, never by a folder."
         },
         "llembas.complete.auto": {
           "type": "boolean",

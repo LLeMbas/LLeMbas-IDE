@@ -93,7 +93,7 @@ class Proposals {
   constructor(texts) {
     this.texts = texts;
     this.byDoc = new Map(); // document uri string -> { uri, hunks, n }
-    this.applying = false;
+    this.applying = new Set(); // documents this extension is changing right now
     this.count = 0;
     this.lensChanged = new vscode.EventEmitter();
     this.onDidChangeCodeLenses = this.lensChanged.event;
@@ -119,6 +119,7 @@ class Proposals {
   }
 
   set(doc, hunks) {
+    this.clear(doc); // an older proposal for this file, and its texts and diff tab
     const n = ++this.count;
     const entry = { uri: doc.uri, hunks, n, proposal: null };
     entry.proposal = this.texts.uri(`proposal/${n}`, path.basename(doc.uri.path) || 'untitled');
@@ -239,11 +240,12 @@ class Proposals {
     }
     let ok = true;
     if (fits.length) {
-      this.applying = true;
+      const key = doc.uri.toString();
+      this.applying.add(key);
       try {
         ok = await vscode.workspace.applyEdit(edit);
       } finally {
-        this.applying = false;
+        this.applying.delete(key);
       }
     }
     if (ok) {
@@ -269,7 +271,7 @@ class Proposals {
 
   /** Somebody typed in a document that has proposals. */
   documentChanged(ev) {
-    if (this.applying) return;
+    if (this.applying.has(ev.document.uri.toString())) return;
     const entry = this.entry(ev.document);
     if (!entry) return;
     const changes = ev.contentChanges.slice().sort((a, b) => b.range.start.line - a.range.start.line);
@@ -306,9 +308,13 @@ class ChatView {
     this.attached = null; // { editor, label }
     this.dirty = new Map();
     this.timer = null;
+    this.reading = new Map(); // item id -> the reply's Markdown, read as it grows
     chat.on('item', (item) => this.queue(item));
     chat.on('reset', () => this.reset());
-    chat.on('state', () => this.post({ type: 'state', state: chat.state() }));
+    chat.on('state', () => {
+      this.flush(); // what was written reaches the page before the news that the turn is over
+      this.post({ type: 'state', state: chat.state() });
+    });
   }
 
   resolveWebviewView(view) {
@@ -337,7 +343,11 @@ class ChatView {
 
   /** An item as the page is given it: a model's text as a tree, a picture as an address the page may load. */
   present(item) {
-    if (item.kind === 'agent') return { id: item.id, kind: 'agent', ast: markdown.parse(item.text) };
+    if (item.kind === 'agent') {
+      let growing = this.reading.get(item.id);
+      if (!growing) this.reading.set(item.id, (growing = new markdown.Growing()));
+      return { id: item.id, kind: 'agent', ast: growing.update(item.text) };
+    }
     if (item.kind === 'media') {
       const entry = this.shown.get(item.key);
       const src = item.picture && entry && entry.file && this.view ? this.view.webview.asWebviewUri(vscode.Uri.file(entry.file)).toString() : '';
@@ -347,19 +357,26 @@ class ChatView {
   }
 
   queue(item) {
-    // A reply arrives in many small pieces; the page is told at most twenty times a second.
+    // A reply arrives in many small pieces; the page is told at most twenty times a second, and
+    // less often the longer the reply is, since the page draws the whole of it each time.
     this.dirty.set(item.id, item);
     if (this.timer) return;
-    this.timer = setTimeout(() => {
-      this.timer = null;
-      const items = [...this.dirty.values()];
-      this.dirty.clear();
-      for (const it of items) this.post({ type: 'item', item: this.present(it) });
-    }, 50);
+    const length = typeof item.text === 'string' ? item.text.length : 0;
+    const pause = length > 200000 ? 1000 : length > 50000 ? 400 : length > 10000 ? 150 : 50;
+    this.timer = setTimeout(() => this.flush(), pause);
+  }
+
+  flush() {
+    if (this.timer) clearTimeout(this.timer);
+    this.timer = null;
+    const items = [...this.dirty.values()];
+    this.dirty.clear();
+    for (const it of items) this.post({ type: 'item', item: this.present(it) });
   }
 
   reset() {
     this.dirty.clear();
+    this.reading.clear();
     this.post({
       type: 'reset',
       items: this.chat.items.map((i) => this.present(i)),
@@ -442,6 +459,7 @@ function activate(context) {
   const shown = new Map();
   let shownCount = 0;
   let rewrites = 0;
+  const rewriting = new Set(); // documents a rewrite is being written for
 
   const texts = new DiffTexts();
   const proposals = new Proposals(texts);
@@ -457,6 +475,29 @@ function activate(context) {
       // A file that is not open is the agent's to read from the disk itself, under its own permissions.
       if (!doc) throw { code: -32002, message: 'not open in the editor: ' + p.path };
       return { content: sliceLines(doc.getText(), p.line, p.limit) };
+    },
+
+    /**
+     * ACP `fs/write_text_file`: the text becomes the content of the open document and is saved
+     * before the answer. Only that one document is touched. A file that is not open here is an
+     * error, which tells the agent to write the disk itself.
+     */
+    async writeTextFile(p) {
+      if (!p || typeof p.path !== 'string' || !path.isAbsolute(p.path) || typeof p.content !== 'string') {
+        throw { code: -32602, message: 'an absolute path and the content are needed' };
+      }
+      const doc = vscode.workspace.textDocuments.find((d) => d.uri.scheme === 'file' && !d.isClosed && samePath(d.uri.fsPath, p.path));
+      if (!doc) throw { code: -32002, message: 'not open in the editor: ' + p.path };
+      const eol = doc.eol === vscode.EndOfLine.CRLF ? '\r\n' : '\n';
+      const wanted = p.content.replace(/\r\n/g, '\n').replace(/\n/g, eol);
+      if (doc.getText() !== wanted) {
+        const last = doc.lineAt(doc.lineCount - 1);
+        const edit = new vscode.WorkspaceEdit();
+        edit.replace(doc.uri, new vscode.Range(new vscode.Position(0, 0), last.range.end), wanted);
+        if (!(await vscode.workspace.applyEdit(edit))) throw { code: -32603, message: 'the editor did not take the text' };
+      }
+      if (doc.isDirty && !(await doc.save())) throw { code: -32603, message: 'the editor could not save ' + p.path };
+      return {};
     },
 
     /** An approval card that carries diffs: each opens in the editor's own diff view before the answer. */
@@ -489,14 +530,20 @@ function activate(context) {
       return { ...got, key };
     },
 
-    /** `_lembas/show` with text: opened as a document. HTML is opened as its text, never drawn. */
+    /** `_lembas/show` with text: opened as a read-only document. HTML is opened as its text, never drawn. */
     async showText(p) {
       const file = typeof p.path === 'string' && p.path ? path.resolve(workingDirectory(), p.path) : '';
       const line = Number.isInteger(p.line) && p.line > 0 ? p.line - 1 : 0;
       try {
-        let doc;
-        if (file && fs.existsSync(file)) doc = await vscode.workspace.openTextDocument(vscode.Uri.file(file));
-        else doc = await vscode.workspace.openTextDocument({ content: String(p.text) });
+        let uri;
+        if (file && fs.existsSync(file)) uri = vscode.Uri.file(file);
+        else {
+          // Not a file here: a document of the extension's own, which cannot be edited and so
+          // never asks to be saved.
+          uri = texts.uri(`shown/${++shownCount}`, path.basename(String(p.path || 'text')));
+          texts.set(uri, String(p.text));
+        }
+        const doc = await vscode.workspace.openTextDocument(uri);
         const at = new vscode.Position(Math.min(line, doc.lineCount - 1), 0);
         await vscode.window.showTextDocument(doc, { preview: true, preserveFocus: true, selection: new vscode.Range(at, at) });
         return { shown: true };
@@ -513,6 +560,7 @@ function activate(context) {
         args: ['serve', '--stdio'],
         cwd: o.cwd,
         onRequest: o.onRequest,
+        writeTextFile: true,
         clientInfo: { name: 'llembas-vscode', version },
       }),
     cwd: workingDirectory,
@@ -578,23 +626,25 @@ function activate(context) {
     },
     async openShown(key) {
       const entry = shown.get(key);
-      if (!entry) return;
-      if (entry.picture && entry.file) return vscode.commands.executeCommand('vscode.open', vscode.Uri.file(entry.file));
-      const target = entry.original || entry.file;
-      if (!target) return;
-      if (media.mayRun(path.basename(target))) {
-        const pick = await vscode.window.showWarningMessage(
-          `${path.basename(target)} is a kind of file your system may run rather than show, so LLeMbas does not open it.`,
-          'Show it in its folder',
-        );
-        if (pick) vscode.commands.executeCommand('revealFileInOS', vscode.Uri.file(target));
-        return;
-      }
-      vscode.env.openExternal(vscode.Uri.file(target));
+      if (!entry) return undefined;
+      const target = entry.file || entry.original;
+      if (!target) return undefined;
+      const uri = vscode.Uri.file(target);
+      // Only kinds that are merely displayed are opened, and only when the bytes are that kind.
+      if (entry.open && entry.open.how === 'editor') return vscode.commands.executeCommand('vscode.open', uri);
+      if (entry.open && entry.open.how === 'system') return vscode.env.openExternal(uri);
+      return vscode.commands.executeCommand('revealFileInOS', uri);
     },
   };
   const view = new ChatView(context, chat, shown, actions);
   context.subscriptions.push(vscode.window.registerWebviewViewProvider(VIEW_ID, view, { webviewOptions: { retainContextWhenHidden: true } }));
+
+  // The files the agent showed belong to the transcript: when it is cleared they go too.
+  chat.on('reset', () => {
+    for (const entry of shown.values()) if (entry.file) fs.rm(entry.file, { force: true }, () => {});
+    shown.clear();
+    texts.dropUnder('/shown/');
+  });
 
   // A card must be seen to be answered: the view is brought forward when one arrives.
   chat.on('item', (item) => {
@@ -622,7 +672,19 @@ function activate(context) {
     const editor = vscode.window.activeTextEditor;
     if (!editor || editor.selection.isEmpty) return vscode.window.showInformationMessage('LLeMbas: select the lines to rewrite first.');
     const doc = editor.document;
+    const key = doc.uri.toString();
     if (proposals.pending(doc)) return vscode.window.showWarningMessage('LLeMbas: accept or reject the changes shown in this file first.');
+    if (rewriting.has(key)) return vscode.window.showWarningMessage('LLeMbas: a rewrite of this file is still being written.');
+    rewriting.add(key);
+    try {
+      return await rewriteIn(editor);
+    } finally {
+      rewriting.delete(key);
+    }
+  }
+
+  async function rewriteIn(editor) {
+    const doc = editor.document;
     const sel = editor.selection;
     const { first, last } = hunksOf.wholeLines({ startLine: sel.start.line, endLine: sel.end.line, endCharacter: sel.end.character });
     const name = doc.uri.scheme === 'file' ? vscode.workspace.asRelativePath(doc.uri, false) : 'untitled';
@@ -688,6 +750,7 @@ function activate(context) {
     const hunks = hunksOf.propose(first, old, fresh);
     if (!hunks.length) return vscode.window.showInformationMessage('LLeMbas: the rewrite changes nothing.');
     const made = proposals.set(doc, hunks);
+    rewriting.delete(doc.uri.toString()); // the proposal is up; what follows only waits for an answer
     if (config().get('rewrite.openDiff')) proposals.showDiff(doc).then(undefined, () => {});
     const n = hunks.length;
     const pick = await vscode.window.showInformationMessage(
@@ -873,9 +936,7 @@ function activate(context) {
   command('llembas.open', () => view.reveal(true));
   command('llembas.newSession', actions.newSession);
   command('llembas.stop', () => chat.stop());
-  command('llembas.restart', () => {
-    if (chat.agent) chat.agent.stop();
-  });
+  command('llembas.restart', () => chat.stopAgent());
   command('llembas.ask', ask);
   command('llembas.rewrite', rewrite);
   command('llembas.complete', () => vscode.commands.executeCommand('editor.action.inlineSuggest.trigger'));
@@ -919,7 +980,7 @@ function activate(context) {
     ),
     vscode.workspace.onDidChangeConfiguration((ev) => {
       // Another command for the agent: the running one is stopped, and the next request starts the new one.
-      if (ev.affectsConfiguration('llembas.command') && chat.agent) chat.agent.stop();
+      if (ev.affectsConfiguration('llembas.command')) chat.stopAgent();
     }),
     proposals.removed,
     proposals.added,

@@ -93,6 +93,9 @@ class Chat extends EventEmitter {
         return null;
       }
     }
+    // An agent that was told to stop but has not gone yet: its session goes now, not when its
+    // exit is heard — by then a new agent is the current one and the exit would be ignored.
+    if (this.agent) this._retire(this.agent, null);
     // Completion asks at every pause in typing: a command that is not there is not tried each time.
     if (quiet && this.failedAt && this.now() - this.failedAt < 60000) return null;
     const agent = this.io.makeAgent({ cwd: this.io.cwd(), onRequest: (method, params) => this._onRequest(agent, method, params) });
@@ -116,14 +119,28 @@ class Chat extends EventEmitter {
   }
 
   _onExit(agent, e) {
+    this._retire(agent, e);
+  }
+
+  /** The agent is gone, or going: everything that belonged to it is let go. Once per agent. */
+  _retire(agent, e) {
     if (this.agent !== agent) return;
     const had = this.session !== null || this.sessionStarting !== null || this.busy;
     this.agent = null;
     for (const card of [...this.cards.values()]) this._settle(card, 'The agent stopped before this was answered.');
     this._clearSession();
-    if (e.started && had) this.note(`The agent stopped (${e.signal || 'exit ' + e.code})${e.last ? ': ' + e.last : '.'}`);
+    if (e && e.started && had) this.note(`The agent stopped (${e.signal || 'exit ' + e.code})${e.last ? ': ' + e.last : '.'}`);
+    else if (!e && had) this.note('The agent was stopped. The next message starts a new session.');
     this.emit('stopped');
     this.emit('state');
+  }
+
+  /** Stop the agent on purpose (another command, or the person asked). It starts again when needed. */
+  stopAgent() {
+    const agent = this.agent;
+    if (!agent) return;
+    agent.stop();
+    this._retire(agent, null);
   }
 
   /** A request of the editor's own (`_lembas/complete`, `_lembas/edit`, …). Rejects when the agent cannot be had. */
@@ -343,6 +360,10 @@ class Chat extends EventEmitter {
       if (!this.hooks.readTextFile) throw { code: -32601, message: 'Method not found: ' + method };
       return this.hooks.readTextFile(params);
     }
+    if (method === 'fs/write_text_file') {
+      if (!this.hooks.writeTextFile) throw { code: -32601, message: 'Method not found: ' + method };
+      return Promise.resolve(this.hooks.writeTextFile(params)).then(() => ({}));
+    }
     if (method === '_lembas/show') return this._onShow(agent, params);
     throw { code: -32601, message: 'Method not found: ' + method };
   }
@@ -430,7 +451,7 @@ class Chat extends EventEmitter {
         this.note(`${(got && got.name) || 'A file'} was not shown: ${reason}`);
         return { shown: false, reason };
       }
-      this.add({ kind: 'media', name: got.name, size: got.size, picture: !!got.picture, src: got.src || '', key: got.key || '' });
+      this.add({ kind: 'media', name: got.name, size: got.size, picture: !!got.picture, src: got.src || '', key: got.key || '', opens: !!got.open });
       this.said = 'tool';
       return { shown: true };
     }

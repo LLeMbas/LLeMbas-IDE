@@ -2,7 +2,7 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
 const crypto = require('node:crypto');
-const { sniffPicture, sizeInWords, safeName, mayRun, fetchShown } = require('../src/media');
+const { sniffPicture, sizeInWords, safeName, openable, fetchShown } = require('../src/media');
 
 test('a picture is known by its bytes, not by its name or by what the agent calls it', () => {
   const pad = Buffer.alloc(16);
@@ -36,9 +36,39 @@ test('a file name is made harmless', () => {
   assert.ok(safeName('x'.repeat(500) + '.png').length <= 80);
 });
 
-test('files the system might run are never opened for the person', () => {
-  for (const name of ['run.sh', 'setup.EXE', 'a.desktop', 'page.html', 'pic.svg', 'x.jar', 'tool.py', 'noending', 'x.AppImage']) assert.equal(mayRun(name), true, name);
-  for (const name of ['report.pdf', 'sound.mp3', 'clip.mp4', 'data.csv', 'model.glb', 'archive.zip', 'notes.txt']) assert.equal(mayRun(name), false, name);
+const bytes = (text) => Buffer.concat([Buffer.from(text, 'latin1'), Buffer.alloc(16, 0x20)]);
+const PNG_HEAD = Buffer.concat([Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]), Buffer.alloc(16)]);
+
+test('Open is an allow-list: only kinds that are merely displayed, and only when bytes and name agree', () => {
+  // What opens, and where.
+  assert.deepEqual(openable(PNG_HEAD, 'chart.png'), { kind: 'image', how: 'editor' });
+  assert.deepEqual(openable(bytes('\xff\xd8\xff\xe0'), 'photo.JPEG'), { kind: 'image', how: 'editor' });
+  assert.deepEqual(openable(bytes('%PDF-1.7\n'), '/tmp/x/report.pdf'), { kind: 'pdf', how: 'system' });
+  assert.deepEqual(openable(bytes('ID3\x04\x00'), 'song.mp3'), { kind: 'audio', how: 'system' });
+  assert.deepEqual(openable(bytes('RIFF\x10\x00\x00\x00WAVEfmt '), 'beep.wav'), { kind: 'audio', how: 'system' });
+  assert.deepEqual(openable(bytes('OggS\x00'), 'voice.ogg'), { kind: 'audio', how: 'system' });
+  assert.deepEqual(openable(bytes('\x00\x00\x00\x20ftypisom'), 'clip.mp4'), { kind: 'video', how: 'system' });
+  assert.deepEqual(openable(bytes('\x1a\x45\xdf\xa3'), 'clip.webm'), { kind: 'video', how: 'system' });
+  assert.deepEqual(openable(Buffer.from('a,b\n1,2\n'), 'data.csv'), { kind: 'text', how: 'editor' }, 'plain text opens inside the editor, never in a spreadsheet');
+  assert.deepEqual(openable(Buffer.from('žluťoučký 🍞\n'), 'notes.txt'), { kind: 'text', how: 'editor' });
+  assert.deepEqual(openable(Buffer.from('abc 🍞').subarray(0, 6), 'cut.md'), { kind: 'text', how: 'editor' }, 'a window that ends inside a character');
+
+  // Everything the review named, and the rest of what a system might run: never opened.
+  const script = Buffer.from('#!/bin/sh\necho run\n');
+  for (const name of ['run.sh', 'tool.py', 'tool.pyw', 'help.chm', 'console.msc', 'page.mht', 'app.jnlp', 'letter.docm', 'sheet.xlsm', 'mod.psm1', 'x.ws',
+    'setup.application', 'a.settingcontent-ms', 'fix.diagcab', 'setup.exe', 'a.desktop', 'page.html', 'pic.svg', 'x.jar', 'x.AppImage', 'link.lnk', 'site.url', 'noending', 'a.unknownkind']) {
+    assert.equal(openable(script, name), null, name);
+    assert.equal(openable(PNG_HEAD, name), null, name + ' with a picture inside');
+  }
+  // A name that lies about its bytes, either way round.
+  assert.equal(openable(script, 'report.pdf'), null, 'not a PDF inside');
+  assert.equal(openable(bytes('%PDF-1.7\n'), 'report.txt'), null, 'a PDF called text');
+  assert.equal(openable(bytes('MZ\x90\x00\x03\x00\x00\x00'), 'song.mp3'), null, 'a program called a song');
+  assert.equal(openable(PNG_HEAD, 'chart.gif'), null);
+  assert.equal(openable(Buffer.from([0x74, 0x65, 0x00, 0x78, 0x74]), 'notes.txt'), null, 'text does not hold a zero byte');
+  assert.equal(openable(Buffer.from([0xff, 0xfe, 0x41, 0x00]), 'notes.txt'), null);
+  assert.equal(openable(Buffer.alloc(0), 'notes.txt'), null);
+  assert.equal(openable(null, 'notes.txt'), null);
 });
 
 function reader(bytes, part) {

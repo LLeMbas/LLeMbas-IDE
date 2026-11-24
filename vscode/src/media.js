@@ -36,16 +36,67 @@ function safeName(path, fallbackExt) {
   return name;
 }
 
-const RUNNABLE = new Set([
-  'exe', 'bat', 'cmd', 'com', 'scr', 'msi', 'msp', 'pif', 'lnk', 'ps1', 'vbs', 'vbe', 'js', 'jse', 'wsf', 'wsh', 'hta', 'cpl', 'reg',
-  'sh', 'bash', 'zsh', 'fish', 'command', 'desktop', 'appimage', 'run', 'bin', 'app', 'jar', 'py', 'pl', 'rb', 'php', 'scpt', 'workflow',
-  'action', 'url', 'html', 'htm', 'xhtml', 'svg', 'dmg', 'pkg', 'deb', 'rpm',
-]);
+// What Open may do with a shown file. Only kinds that are merely displayed are ever opened, and
+// only when the file's first bytes are that kind AND its name ends as that kind does: the system
+// chooses its program by the name, so a name the bytes do not back is never handed to it.
+// Everything else can only be shown in its folder.
+const TEXT_ENDINGS = new Set(['txt', 'text', 'log', 'md', 'markdown', 'csv', 'tsv', 'json', 'jsonl', 'yaml', 'yml', 'toml', 'ini', 'diff', 'patch']);
+const SHOWN_KINDS = [
+  { kind: 'pdf', endings: ['pdf'], is: (b) => b.toString('latin1', 0, 5) === '%PDF-' },
+  { kind: 'audio', endings: ['mp3'], is: (b) => b.toString('latin1', 0, 3) === 'ID3' || (b[0] === 0xff && (b[1] & 0xe6) === 0xe2) },
+  { kind: 'audio', endings: ['wav'], is: (b) => b.toString('latin1', 0, 4) === 'RIFF' && b.toString('latin1', 8, 12) === 'WAVE' },
+  { kind: 'audio', endings: ['ogg', 'oga', 'opus'], is: (b) => b.toString('latin1', 0, 4) === 'OggS' },
+  { kind: 'audio', endings: ['flac'], is: (b) => b.toString('latin1', 0, 4) === 'fLaC' },
+  { kind: 'audio', endings: ['m4a'], is: (b) => b.toString('latin1', 4, 8) === 'ftyp' && /^(M4A |M4B |mp42|isom)$/.test(b.toString('latin1', 8, 12)) },
+  { kind: 'video', endings: ['mp4', 'm4v'], is: (b) => b.toString('latin1', 4, 8) === 'ftyp' && /^(isom|iso[2-9]|mp41|mp42|avc1|M4V |dash)$/.test(b.toString('latin1', 8, 12)) },
+  { kind: 'video', endings: ['mov'], is: (b) => b.toString('latin1', 4, 8) === 'ftyp' && b.toString('latin1', 8, 12) === 'qt  ' },
+  { kind: 'video', endings: ['webm', 'mkv'], is: (b) => b[0] === 0x1a && b[1] === 0x45 && b[2] === 0xdf && b[3] === 0xa3 },
+];
+const PICTURE_ENDINGS = { png: ['png'], jpg: ['jpg', 'jpeg'], gif: ['gif'], webp: ['webp'], avif: ['avif'] };
 
-/** Whether the system might run a file of this name instead of showing it. */
-function mayRun(name) {
-  const m = /\.([A-Za-z0-9]+)$/.exec(String(name));
-  return !m || RUNNABLE.has(m[1].toLowerCase());
+function ending(name) {
+  const m = /\.([A-Za-z0-9]+)$/.exec(String(name || ''));
+  return m ? m[1].toLowerCase() : '';
+}
+
+function looksLikeText(buf) {
+  if (!buf || buf.length === 0) return false;
+  for (let i = 0; i < buf.length; i++) {
+    const c = buf[i];
+    if (c === 0 || (c < 0x20 && c !== 0x09 && c !== 0x0a && c !== 0x0d && c !== 0x0c)) return false;
+  }
+  // The window may end inside a character; up to three bytes are let go before judging.
+  for (let cut = 0; cut <= 3 && cut < buf.length; cut++) {
+    try {
+      new TextDecoder('utf-8', { fatal: true }).decode(buf.subarray(0, buf.length - cut));
+      return true;
+    } catch {
+      // try a shorter window
+    }
+  }
+  return false;
+}
+
+/**
+ * How a shown file may be opened, from its first bytes and its name:
+ * `{ kind, how }` — `how` is `'editor'` (pictures and plain text: opened inside the editor, which
+ * runs nothing) or `'system'` (pdf, sound, video: the system's viewer); or `null` when the file
+ * may only be shown in its folder.
+ */
+function openable(head, name) {
+  const end = ending(name);
+  if (!head || !end) return null;
+  const picture = sniffPicture(head);
+  if (picture) return PICTURE_ENDINGS[picture.ext].includes(end) ? { kind: 'image', how: 'editor' } : null;
+  let known = false;
+  for (const k of SHOWN_KINDS) {
+    if (head.length < 12 || !k.is(head)) continue;
+    if (k.endings.includes(end)) return { kind: k.kind, how: 'system' };
+    known = true;
+  }
+  if (known) return null; // the bytes are a kind the name does not say
+  if (TEXT_ENDINGS.has(end) && looksLikeText(head)) return { kind: 'text', how: 'editor' };
+  return null;
 }
 
 /**
@@ -95,7 +146,8 @@ function tooLarge(size, max) {
  * @param {(params: object) => Promise<object>} read `_lembas/show/read`
  * @param {{ dir: string, maxBytes: number, length?: number, fs?: object }} where
  * @returns {Promise<{ ok: boolean, reason?: string, name: string, size: number, picture: boolean,
- *                     mime?: string, file?: string, original?: string }>}
+ *                     mime?: string, file?: string, original?: string,
+ *                     open: { kind: string, how: 'editor' | 'system' } | null }>}
  */
 async function receiveShown(p, read, where) {
   const fs = where.fs || require('node:fs/promises');
@@ -116,7 +168,7 @@ async function receiveShown(p, read, where) {
     const head = await read({ handle: p.handle, offset: 0, length: 4096 });
     const first = Buffer.from(head && typeof head.data === 'string' ? head.data : '', 'base64');
     const picture = sniffPicture(first);
-    if (!picture && original) return { ...base, ok: true, original, size: size === undefined ? 0 : size };
+    if (!picture && original) return { ...base, ok: true, original, size: size === undefined ? 0 : size, open: openable(first, original) };
     const bytes = head && head.eof && (size === undefined || first.length === size) && !p.hash
       ? first
       : await fetchShown(read, { handle: p.handle, size, hash: p.hash }, { maxBytes: where.maxBytes, length: where.length });
@@ -126,10 +178,10 @@ async function receiveShown(p, read, where) {
     if (picture && !name.toLowerCase().endsWith('.' + picture.ext)) name = name.replace(/\.[A-Za-z0-9]{1,8}$/, '') + '.' + picture.ext;
     const file = path.join(where.dir, `${receiveShown.count}-${name}`);
     await fs.writeFile(file, bytes, { mode: 0o600, flag: 'wx' });
-    return { ok: true, name, size: bytes.length, picture: !!picture, mime: picture ? picture.mime : undefined, file, original };
+    return { ok: true, name, size: bytes.length, picture: !!picture, mime: picture ? picture.mime : undefined, file, original, open: openable(bytes.subarray(0, 4096), file) };
   } catch (e) {
     return { ...base, reason: (e && e.message) || 'The file could not be fetched.' };
   }
 }
 
-module.exports = { sniffPicture, sizeInWords, safeName, mayRun, fetchShown, receiveShown, PART };
+module.exports = { sniffPicture, sizeInWords, safeName, openable, fetchShown, receiveShown, PART };

@@ -11,7 +11,7 @@ const PROTOCOL_VERSION = 1;
 class Agent extends EventEmitter {
   /**
    * @param {{ command: string, args?: string[], cwd?: string, env?: object,
-   *           clientInfo?: { name: string, version: string },
+   *           clientInfo?: { name: string, version: string }, writeTextFile?: boolean,
    *           onRequest?: (method: string, params: any) => any }} options
    * Events: `notify (method, params)`, `stderr (text)`, `exit ({ code, last })`.
    */
@@ -91,7 +91,9 @@ class Agent extends EventEmitter {
         .request('initialize', {
           protocolVersion: PROTOCOL_VERSION,
           clientCapabilities: {
-            fs: { readTextFile: true, writeTextFile: false },
+            // Unsaved text: reading always; writing only where the editor can put the text into the
+            // open document and save it before it answers.
+            fs: { readTextFile: true, writeTextFile: !!o.writeTextFile },
             // `show` with `media`: the spec offers the show tool to a client that says `show`,
             // and hands over files that are not text to one that also says `media`.
             _meta: { lembas: { editor: true, media: true, show: true } },

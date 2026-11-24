@@ -10,6 +10,8 @@ A turn is steered by words in the prompt's last text block:
   DIFFPERM <path> asks for an approval that carries a diff, and writes the file when allowed
   WRITE <path>    rewrites that file
   READ <path>     asks the client for the file's text and says it back
+  PUT <path>      asks the client to make "put by the agent" + a line break the file's text; writes
+                  the disk itself when the client answers with an error, as the CLI does
   SHOW <path>     shows that file through a handle
   SHOWTEXT <path> shows that file as text
   META            says back the editor context the prompt carried
@@ -167,6 +169,21 @@ def prompt(msg):
         path = word_after(text, "READ")
         answer = ask("fs/read_text_file", {"sessionId": session, "path": path})
         say(session, "\nread=" + json.dumps((answer or {}).get("content")))
+    if "PUT " in text:
+        path = word_after(text, "PUT")
+        with lock:
+            next_id[0] += 1
+            rid = next_id[0]
+        done = threading.Event()
+        waiting[rid] = [done, None]
+        out({"jsonrpc": "2.0", "id": rid, "method": "fs/write_text_file",
+             "params": {"sessionId": session, "path": path, "content": "put by the agent\n"}})
+        done.wait(10)
+        answer = waiting.pop(rid)[1]
+        if answer is None:
+            with open(path, "w") as f:
+                f.write("put by the agent\n")
+        say(session, "\nput=" + ("client" if answer is not None else "disk"))
     if "SHOWTEXT " in text:
         path = word_after(text, "SHOWTEXT")
         answer = ask("_lembas/show", {"sessionId": session, "toolCallId": "show-t", "path": os.path.basename(path),

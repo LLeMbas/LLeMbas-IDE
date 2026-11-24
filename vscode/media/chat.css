@@ -93,6 +93,7 @@ select:focus, button:focus-visible, textarea:focus, .link:focus-visible {
 
 .md p, .md ul, .md ol, .md pre, .md blockquote, .md h1, .md h2, .md h3, .md h4, .md h5, .md h6 { margin: 0 0 8px; }
 .md > :last-child { margin-bottom: 0; }
+.md .plain { white-space: pre-wrap; }
 .md h1, .md h2, .md h3, .md h4, .md h5, .md h6 { font-size: 1em; font-weight: 600; }
 .md h1 { font-size: 1.2em; }
 .md h2 { font-size: 1.1em; }

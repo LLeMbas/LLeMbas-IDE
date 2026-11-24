@@ -5,11 +5,20 @@
 // text. No `vscode` here.
 //
 // Blocks:  { t: 'p', c }  { t: 'h', l, c }  { t: 'pre', lang, v }  { t: 'hr' }
-//          { t: 'quote', c: blocks }  { t: 'ul' | 'ol', items: [{ d, c }] }
+//          { t: 'quote', c: blocks }  { t: 'ul' | 'ol', items: [{ d, c }] }  { t: 'plain', v }
 // Inline:  { t: 'text', v }  { t: 'code', v }  { t: 'b', c }  { t: 'i', c }
 //          { t: 'a', href, c }  { t: 'br' }
 
 const MAX_DEPTH = 6;
+// What a model writes is not trusted to be short or kind. Three bounds keep the reading of it
+// linear: a text longer than MAX_CHARS is shown as it was written; a line longer than MAX_LINE
+// is never matched against the block patterns; and the searches for a closing mark (emphasis,
+// a link's bracket) draw on one budget of steps per parse — when it is spent, the rest of the
+// text is plain text.
+const MAX_CHARS = 400000;
+const MAX_LINE = 4000;
+const BUDGET = 400000;
+const LABEL_MAX = 1000;
 
 /** A link the chat may offer to open: http, https or mailto, and nothing else. */
 function safeHref(url) {
@@ -31,8 +40,9 @@ function isWord(ch) {
   return ch !== undefined && /[\p{L}\p{N}]/u.test(ch);
 }
 
-function findClosing(s, from, marker) {
+function findClosing(s, from, marker, work) {
   for (let i = from; i < s.length; i++) {
+    if (--work.left < 0) return -1;
     if (s[i] === '\\') {
       i++;
       continue;
@@ -61,11 +71,22 @@ function findClosing(s, from, marker) {
   return -1;
 }
 
-function parseInline(s, depth) {
+function parseInline(s, depth, budget) {
   const out = [];
   const deep = (depth || 0) >= MAX_DEPTH;
+  const work = budget || { left: BUDGET };
+  const noTicks = {}; // run length -> no closing run of that length from here on
   let i = 0;
   while (i < s.length) {
+    if (work.left < 0) {
+      // The budget is spent: the rest is text, line breaks kept.
+      const rest = s.slice(i).split('\n');
+      rest.forEach((line, n) => {
+        if (n) out.push({ t: 'br' });
+        pushText(out, line);
+      });
+      break;
+    }
     const ch = s[i];
     if (ch === '\n') {
       out.push({ t: 'br' });
@@ -80,7 +101,8 @@ function parseInline(s, depth) {
     if (ch === '`') {
       let n = 1;
       while (s[i + n] === '`') n++;
-      const close = s.indexOf('`'.repeat(n), i + n);
+      const close = noTicks[n] ? -1 : s.indexOf('`'.repeat(n), i + n);
+      if (close < 0) noTicks[n] = true;
       if (close >= 0) {
         let v = s.slice(i + n, close).replace(/\n/g, ' ');
         if (v.length > 2 && v.startsWith(' ') && v.endsWith(' ')) v = v.slice(1, -1);
@@ -98,9 +120,9 @@ function parseInline(s, depth) {
       const next = s[i + marker.length];
       const opens = next !== undefined && !/\s/.test(next) && !(ch === '_' && isWord(s[i - 1]));
       if (opens) {
-        const close = findClosing(s, i + marker.length, marker);
+        const close = findClosing(s, i + marker.length, marker, work);
         if (close > 0) {
-          out.push({ t: double ? 'b' : 'i', c: parseInline(s.slice(i + marker.length, close), (depth || 0) + 1) });
+          out.push({ t: double ? 'b' : 'i', c: parseInline(s.slice(i + marker.length, close), (depth || 0) + 1, work) });
           i = close + marker.length;
           continue;
         }
@@ -113,7 +135,8 @@ function parseInline(s, depth) {
       const open = ch === '!' ? i + 1 : i;
       let level = 0;
       let close = -1;
-      for (let j = open; j < s.length; j++) {
+      for (let j = open; j < s.length && j < open + LABEL_MAX; j++) {
+        if (--work.left < 0) break;
         if (s[j] === '\\') j++;
         else if (s[j] === '[') level++;
         else if (s[j] === ']' && --level === 0) {
@@ -124,7 +147,8 @@ function parseInline(s, depth) {
       if (close > 0 && s[close + 1] === '(') {
         let end = -1;
         let parens = 0;
-        for (let j = close + 1; j < s.length; j++) {
+        for (let j = close + 1; j < s.length && j < close + 2100; j++) {
+          if (--work.left < 0) break;
           if (s[j] === '(') parens++;
           else if (s[j] === ')' && --parens === 0) {
             end = j;
@@ -138,7 +162,7 @@ function parseInline(s, depth) {
           const label = s.slice(open + 1, close);
           if (href) {
             // A picture is never loaded: it is a link like any other.
-            const c = ch === '!' ? [{ t: 'text', v: label || href }] : parseInline(label, (depth || 0) + 1);
+            const c = ch === '!' ? [{ t: 'text', v: label || href }] : parseInline(label, (depth || 0) + 1, work);
             out.push({ t: 'a', href, c: c.length ? c : [{ t: 'text', v: href }] });
             i = end + 1;
             continue;
@@ -172,23 +196,48 @@ function parseInline(s, depth) {
 }
 
 const FENCE = /^ {0,3}(`{3,}|~{3,})\s*([^\s`]*)[^`]*$/;
-const HEADING = /^ {0,3}(#{1,6})\s+(.*?)\s*#*\s*$/;
+const HEADING = /^ {0,3}(#{1,6})[ \t]+(\S.*)$/;
 const RULE = /^ {0,3}([-*_])(?:\s*\1){2,}\s*$/;
 const ITEM = /^(\s*)([-*+]|\d{1,9}[.)])\s+(.*)$/;
 const QUOTE = /^ {0,3}>\s?(.*)$/;
 
+/** A heading's text without the closing run of # some write after it. */
+function headingText(text) {
+  let end = text.length;
+  while (end > 0 && (text[end - 1] === ' ' || text[end - 1] === '\t')) end--;
+  let hashes = end;
+  while (hashes > 0 && text[hashes - 1] === '#') hashes--;
+  if (hashes < end && (hashes === 0 || text[hashes - 1] === ' ' || text[hashes - 1] === '\t')) end = hashes;
+  while (end > 0 && (text[end - 1] === ' ' || text[end - 1] === '\t')) end--;
+  return text.slice(0, end);
+}
+
 /** Markdown text to a list of blocks. */
-function parse(src, depth) {
+function parse(src, depth, budget) {
+  return read(src, depth, budget).blocks;
+}
+
+/** As `parse`, and whether the text ended inside a fenced block that was not closed. */
+function read(src, depth, budget) {
   const level = depth || 0;
-  const lines = String(src === undefined || src === null ? '' : src).replace(/\r\n?/g, '\n').split('\n');
+  const text = String(src === undefined || src === null ? '' : src).replace(/\r\n?/g, '\n');
+  if (text.length > MAX_CHARS) return { blocks: [{ t: 'plain', v: text }], open: false };
+  const work = budget || { left: BUDGET };
+  const lines = text.split('\n');
   const blocks = [];
+  let open = false;
+  let openAt = -1; // where the fence that was not closed begins
   let para = [];
   const flush = () => {
-    if (para.length) blocks.push({ t: 'p', c: parseInline(para.join('\n'), 0) });
+    if (para.length) blocks.push({ t: 'p', c: parseInline(para.join('\n'), 0, work) });
     para = [];
   };
   for (let i = 0; i < lines.length; i++) {
     const line = lines[i];
+    if (line.length > MAX_LINE) {
+      para.push(line);
+      continue;
+    }
     const fence = FENCE.exec(line);
     if (fence) {
       flush();
@@ -201,6 +250,11 @@ function parse(src, depth) {
         body.push(lines[j]);
       }
       blocks.push({ t: 'pre', lang: fence[2].replace(/[^A-Za-z0-9_+#.-]/g, '').slice(0, 30), v: body.join('\n') });
+      if (j >= lines.length) {
+        open = true;
+        openAt = 0;
+        for (let k = 0; k < i; k++) openAt += lines[k].length + 1;
+      }
       i = j; // an unclosed fence runs to the end: the text is still being written
       continue;
     }
@@ -211,7 +265,7 @@ function parse(src, depth) {
     const heading = HEADING.exec(line);
     if (heading) {
       flush();
-      blocks.push({ t: 'h', l: heading[1].length, c: parseInline(heading[2], 0) });
+      blocks.push({ t: 'h', l: heading[1].length, c: parseInline(headingText(heading[2]), 0, work) });
       continue;
     }
     if (RULE.test(line)) {
@@ -228,7 +282,7 @@ function parse(src, depth) {
         if (!q) break;
         body.push(q[1]);
       }
-      blocks.push({ t: 'quote', c: parse(body.join('\n'), level + 1) });
+      blocks.push({ t: 'quote', c: parse(body.join('\n'), level + 1, work) });
       i = j - 1;
       continue;
     }
@@ -260,14 +314,50 @@ function parse(src, depth) {
           break;
         }
       }
-      blocks.push({ t: ordered ? 'ol' : 'ul', items: items.map((it) => ({ d: it.d, c: parseInline(it.text.join('\n'), 0) })) });
+      blocks.push({ t: ordered ? 'ol' : 'ul', items: items.map((it) => ({ d: it.d, c: parseInline(it.text.join('\n'), 0, work) })) });
       i = j - 1;
       continue;
     }
     para.push(line);
   }
   flush();
-  return blocks;
+  return { blocks, open, openAt };
 }
 
-module.exports = { parse, parseInline, safeHref };
+/**
+ * A reply read as it grows. Text that ends at a blank line outside a fenced block will never be
+ * read differently, whatever follows, so it is read once and kept; only what comes after the
+ * last such place is read again when more arrives. The result is always what `parse` gives for
+ * the whole text.
+ */
+class Growing {
+  constructor() {
+    this.text = '';
+    this.done = 0; // characters of `text` already read for good
+    this.blocks = [];
+  }
+
+  update(text) {
+    const whole = String(text === undefined || text === null ? '' : text).replace(/\r\n?/g, '\n');
+    if (whole.length > MAX_CHARS) return [{ t: 'plain', v: whole }];
+    if (!whole.startsWith(this.text.slice(0, this.done))) {
+      this.done = 0;
+      this.blocks = [];
+    }
+    this.text = whole;
+    let cut = whole.lastIndexOf('\n\n');
+    for (let tries = 0; tries < 2 && cut >= this.done; tries++) {
+      const piece = read(whole.slice(this.done, cut));
+      if (!piece.open) {
+        this.blocks.push(...piece.blocks);
+        this.done = cut + 2;
+        break;
+      }
+      // The blank line is inside a fenced block still being written: settle what is before it.
+      cut = piece.openAt > 0 ? whole.lastIndexOf('\n\n', this.done + piece.openAt - 1) : -1;
+    }
+    return this.blocks.concat(read(whole.slice(this.done)).blocks);
+  }
+}
+
+module.exports = { parse, parseInline, safeHref, Growing, MAX_CHARS };

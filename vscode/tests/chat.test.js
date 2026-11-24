@@ -195,6 +195,66 @@ test("the agent's question for a file's text is the hook's to answer", async (t)
   assert.match(text(chat), /read=null/, 'an error: the agent reads the disk itself');
 });
 
+test("the agent's write of a file goes to the hook; an error tells it to write the disk itself", async (t) => {
+  const dir = tempDir(t);
+  const open = path.join(dir, 'open.txt');
+  const closed = path.join(dir, 'closed.txt');
+  const asked = [];
+  const { chat } = fakeChat(t, {
+    dir,
+    hooks: {
+      writeTextFile: async (p) => {
+        asked.push(p);
+        if (p.path !== open) throw { code: -32002, message: 'not open in the editor' };
+      },
+    },
+  });
+  await chat.send(`PUT ${open}`);
+  assert.match(text(chat), /put=client/);
+  assert.deepEqual(asked[0], { sessionId: 'ses_test', path: open, content: 'put by the agent\n' });
+  assert.ok(!fs.existsSync(open), 'the stand-in did not write: the client said it had');
+  await chat.send(`PUT ${closed}`);
+  assert.match(text(chat), /put=disk/);
+  assert.equal(fs.readFileSync(closed, 'utf8'), 'put by the agent\n');
+});
+
+test('without a write hook the method is not there', async (t) => {
+  const dir = tempDir(t);
+  const { chat } = fakeChat(t, { dir });
+  await chat.send(`PUT ${path.join(dir, 'a.txt')}`);
+  assert.match(text(chat), /put=disk/);
+});
+
+test('an agent stopped on purpose takes its session with it at once, before its exit is heard', async (t) => {
+  const { chat, agents } = fakeChat(t);
+  await chat.send('hello');
+  assert.equal(chat.session, 'ses_test');
+  const turn = chat.send('PERM');
+  await until(() => chat.cards.size === 1);
+  // The old way: the process is told to stop, and something asks for the agent before it has gone.
+  agents[0].stop();
+  const second = await chat.connect(true);
+  assert.equal(agents.length, 2);
+  assert.equal(second, agents[1]);
+  assert.equal(chat.session, null, 'no session id of the agent that is going');
+  assert.equal(chat.cards.size, 0);
+  assert.equal(chat.items.find((i) => i.kind === 'card').state, 'settled');
+  await turn;
+  assert.equal(chat.busy, false);
+  await new Promise((r) => setTimeout(r, 150)); // the old agent's exit arrives and changes nothing
+  assert.equal(chat.agent, agents[1]);
+  await chat.send('hello again');
+  assert.match(text(chat), /You: hello again\nLLeMbas: Hello there\.\nSecond line$/);
+  assert.equal(agents[1].log().filter((m) => m.method === 'session/new').length, 1);
+
+  chat.stopAgent();
+  assert.equal(chat.agent, null);
+  assert.equal(chat.session, null);
+  assert.match(text(chat), /> The agent was stopped\. The next message starts a new session\.$/);
+  await chat.send('once more');
+  assert.equal(agents.length, 3);
+});
+
 test('the models, the session model and the mode', async (t) => {
   const { chat, agents } = fakeChat(t);
   await chat.ensureSession();
@@ -331,6 +391,8 @@ test('a file that is not a picture is a line with Open; one on this machine is n
   assert.equal(item.name, 'report.pdf');
   assert.equal(got[0].original, file);
   assert.equal(got[0].file, undefined);
+  assert.deepEqual(got[0].open, { kind: 'pdf', how: 'system' });
+  assert.equal(item.opens, true);
   assert.equal(agents[0].log().filter((m) => m.method === '_lembas/show/read').length, 1, 'only its first bytes were read');
 });
 
@@ -343,6 +405,8 @@ test('without a file on this machine, the bytes are fetched and written to the s
   assert.equal(got[0].picture, false);
   assert.ok(got[0].file.startsWith(store + path.sep));
   assert.ok(fs.readFileSync(got[0].file).equals(bytes));
+  assert.equal(got[0].open, null, 'a kind nobody knows is never opened');
+  assert.equal(chat.items.find((i) => i.kind === 'media').opens, false);
 });
 
 test('a file over the limit is refused in words, to the person and to the agent', async (t) => {

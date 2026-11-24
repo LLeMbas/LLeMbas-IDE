@@ -10,8 +10,14 @@ test('the hello says what this client is: an editor that shows media and has uns
   const hello = agent.log().find((m) => m.method === 'initialize');
   assert.equal(hello.params.protocolVersion, 1);
   assert.deepEqual(hello.params.clientCapabilities._meta.lembas, { editor: true, media: true, show: true });
-  assert.deepEqual(hello.params.clientCapabilities.fs, { readTextFile: true, writeTextFile: false });
+  assert.deepEqual(hello.params.clientCapabilities.fs, { readTextFile: true, writeTextFile: false }, 'writing is offered only by a client that can do it');
   assert.ok(agent.ready && agent.has('editor') && agent.has('media') && !agent.has('fs'));
+});
+
+test('a client that can put text into its documents says so', async (t) => {
+  const agent = fakeAgent(t, tempDir(t), {}, { writeTextFile: true });
+  await agent.connect();
+  assert.deepEqual(agent.log().find((m) => m.method === 'initialize').params.clientCapabilities.fs, { readTextFile: true, writeTextFile: true });
 });
 
 test('every caller of connect gets the same start', async (t) => {

@@ -60,8 +60,12 @@
   it says so once, with a button to choose one.
 - The two model settings, autocomplete and main: saved in your account, or switched for one
   window only.
-- A picture the agent shows appears in the chat; any other file is a line with Open. Files of
-  more than 64 MB are refused.
-- The agent reads a file you have open as the editor has it, saved or not.
+- A picture the agent shows appears in the chat; any other file is a line there. Open is offered
+  only for kinds that are merely displayed (pictures, plain text, PDF, sound, video), and only
+  when the file's bytes and its name agree; everything else can only be shown in its folder.
+  Files of more than 64 MB are refused.
+- The agent reads a file you have open as the editor has it, saved or not, and a file it writes
+  is put into the open document and saved.
 - What a model writes is drawn as text through the extension's own small Markdown reader: HTML in
   a reply stays text, and only `http`, `https` and `mailto` links open.
+  However long or oddly written a reply is, reading it takes time in step with its length.

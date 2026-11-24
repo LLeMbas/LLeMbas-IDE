@@ -53,7 +53,8 @@ agent changed are named under the tool's line and open with a click.
 
 What a model writes is shown as text. A small Markdown reader in the extension turns it into
 paragraphs, lists, code and links; HTML in a reply stays text, pictures in a reply are not loaded,
-and a link opens in your browser only when it is `http`, `https` or `mailto`.
+and a link opens in your browser only when it is `http`, `https` or `mailto`. A reply of more than
+400,000 characters is shown as it was written.
 
 **Ask about a selection.** Select text, then *LLeMbas: Ask About the Selection*. With a question it
 is sent at once; with an empty one the selection goes with the next message you type. The agent is
@@ -80,13 +81,17 @@ so every editor you sign in from uses it; *Only this window* is a quick switch t
 nowhere. The picker in the chat changes the model of the session you are in.
 
 **Files the agent shows.** A picture the agent shows (a screenshot, a chart) appears in the chat.
-Any other file is a line with *Open*, which hands it to your system's program for that kind of
-file. A file of a kind the system might run instead of show (a script, an installer, a web page)
-is not opened; you are offered its folder. Files of more than 64 MB are refused, and the agent is
-told why (setting *Media: Max Megabytes*).
+Any other file is a line in the chat. *Open* is offered only for kinds that are merely displayed —
+pictures and plain text (opened inside the editor), PDF, sound and video (your system's viewer) —
+and only when the file's first bytes are that kind and its name says the same. Everything else,
+whatever it is called, gets *Show in folder* and is never opened for you. Files of more than 64 MB
+are refused, and the agent is told why (setting *Media: Max Megabytes*). Shown files are kept
+until the chat is cleared by a new session.
 
 **Unsaved text.** When the agent reads a file you have open, it gets the text as the editor has
-it, saved or not.
+it, saved or not. When it writes one, the new text is put into the open document and saved — one
+undo step in the editor — so the file and what you see never part ways. A file that is not open
+is read and written by the agent itself.
 
 ## Commands and keys
 
@@ -117,7 +122,7 @@ On macOS the keys use `Cmd` in place of `Ctrl`.
 | `llembas.command` | `lembas` | the LLeMbas CLI, or its full path. Set for the machine, never by a folder |
 | `llembas.chat.sendEditorContext` | on | tell the agent which file is in front, the cursor, the selection and its problems |
 | `llembas.chat.showThinking` | off | show the model's thinking |
-| `llembas.chat.startMode` | | the mode a new session starts in; empty: the CLI's own |
+| `llembas.chat.startMode` | | the mode a new session starts in; empty: the CLI's own. Set for the machine, never by a folder |
 | `llembas.complete.auto` | on | suggest as you type; off: only on `Alt+\` |
 | `llembas.complete.debounce` | 250 | the pause, in milliseconds, before a suggestion is asked for |
 | `llembas.complete.maxTokens` | 0 | the longest suggestion; 0: the server's own number |

@@ -138,6 +138,7 @@ test('the manifest in the source tree: no dependencies, no build, the version on
   assert.match(pkg.engines.vscode, /^\^1\.\d+\.0$/);
   assert.ok(pkg.activationEvents.length > 0);
   assert.equal(pkg.contributes.configuration.properties['llembas.command'].scope, 'machine', 'a folder cannot say which program is started');
+  assert.equal(pkg.contributes.configuration.properties['llembas.chat.startMode'].scope, 'machine', 'nor the mode a session starts in');
   assert.equal(pkg.capabilities.untrustedWorkspaces.supported, false);
   for (const file of fs.readdirSync(ROOT, { recursive: true })) {
     if (!/\.(js|json|css|md|py)$/.test(file) || /node_modules/.test(file)) continue;

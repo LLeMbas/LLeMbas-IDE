@@ -3,7 +3,7 @@ const test = require('node:test');
 const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const path = require('node:path');
-const { parse, parseInline, safeHref } = require('../src/markdown');
+const { parse, parseInline, safeHref, Growing, MAX_CHARS } = require('../src/markdown');
 const { chatHtml } = require('../src/webview');
 const page = require('../media/chat.js');
 
@@ -55,7 +55,7 @@ function render(src) {
   page.buildBlocks(doc, parse(src), root, 0);
   return root;
 }
-const ALLOWED = new Set(['#text', 'p', 'h1', 'h2', 'h3', 'h4', 'h5', 'h6', 'pre', 'code', 'hr', 'blockquote', 'ul', 'ol', 'li', 'strong', 'em', 'span', 'br']);
+const ALLOWED = new Set(['#text', 'div', 'p', 'h1', 'h2', 'h3', 'h4', 'h5', 'h6', 'pre', 'code', 'hr', 'blockquote', 'ul', 'ol', 'li', 'strong', 'em', 'span', 'br']);
 
 test('paragraphs, emphasis, code and line breaks', () => {
   assert.equal(render('Hello **bold** and *it* and `x < y`.\nnext').show(), 'div(p("Hello " strong("bold") " and " em("it") " and " code("x < y") "." br() "next"))');
@@ -145,6 +145,87 @@ test('deeply nested or enormous input does not hang or overflow', () => {
   assert.deepEqual(parse(null), []);
 });
 
+test('hostile and very long replies are read in linear time', () => {
+  const n = 200000;
+  const cases = {
+    'unclosed brackets': '['.repeat(n),
+    'brackets with a far close': '[a '.repeat(n / 4) + ']',
+    'unclosed emphasis': '*a '.repeat(n / 3),
+    'unclosed double emphasis': '**a '.repeat(n / 4),
+    'underscores': '_a '.repeat(n / 3),
+    'mixed marks': '*_[`'.repeat(n / 4),
+    'backtick runs of every length': Array.from({ length: 600 }, (_, i) => '`'.repeat(i + 1)).join(' '),
+    'a heading of spaces and hashes': '# ' + ' #'.repeat(n / 2) + ' x',
+    'a heading of spaces': '# a' + ' '.repeat(n) + 'b',
+    'a rule that is not one': '- '.repeat(n / 2) + 'x',
+    'one enormous line': 'word '.repeat(n / 5),
+    'a list marker and spaces': '-' + ' '.repeat(n) + 'x',
+    'links without an end': '[a](https://example.org/'.repeat(n / 24),
+    'many paragraphs of marks': '*a [b `c\n\n'.repeat(n / 12),
+    'quotes in quotes': '> '.repeat(n / 2) + 'x',
+  };
+  for (const [name, text] of Object.entries(cases)) {
+    const started = process.hrtime.bigint();
+    const blocks = parse(text);
+    const ms = Number(process.hrtime.bigint() - started) / 1e6;
+    assert.ok(ms < 1500, `${name}: ${Math.round(ms)} ms for ${text.length} characters`);
+    assert.ok(blocks.length > 0, name);
+  }
+  // Nothing is lost when the budget runs out: the rest is text.
+  const spent = parse('*a '.repeat(n / 3));
+  const flatten = (nodes) => nodes.map((x) => (x.v !== undefined ? x.v : x.c ? flatten(x.c) : x.t === 'br' ? '\n' : '')).join('');
+  assert.equal(flatten(spent), '*a '.repeat(n / 3));
+});
+
+test('a text beyond the limit is shown as it was written', () => {
+  const big = '**x** <b>'.repeat(MAX_CHARS / 9 + 10);
+  assert.deepEqual(parse(big), [{ t: 'plain', v: big }]);
+  const root = render(big);
+  assert.equal(root.show().slice(0, 30), 'div(div("**x** <b>**x** <b>**x');
+  assert.equal(root.textContent, big);
+});
+
+test('a heading keeps its text and loses only a closing run of hashes', () => {
+  assert.equal(render('## Two ##   ').show(), 'div(h2("Two"))');
+  assert.equal(render('# C# and F#').show(), 'div(h1("C# and F#"))');
+  assert.equal(render('# a # b').show(), 'div(h1("a # b"))');
+  assert.equal(render('###### deep').show(), 'div(h6("deep"))');
+  assert.equal(render('#notaheading').show(), 'div(p("#notaheading"))');
+});
+
+test('a reply read as it grows is read the same as the whole, and old text is not read again', () => {
+  const reply = [
+    '# Bread', '', 'Some **bold** text with `code` and a [link](https://example.org).', 'second line', '',
+    '- one', '- two', '  - inner', '', '1. first', '2. second', '', '> quoted', '> more', '',
+    '```python', 'def bake():', '', '    return "**not bold**"', '', '```', '', '| a | b |', '|---|---|', '', '---', '',
+    'A last paragraph that ends without', 'a line break, then an open fence:', '', '~~~', 'still', '', 'open',
+  ].join('\n');
+  // Fed in pieces of every size, as a model sends it.
+  for (const step of [1, 2, 3, 7, 19, 64, 1000]) {
+    const growing = new Growing();
+    for (let end = step; end < reply.length + step; end += step) {
+      const part = reply.slice(0, end);
+      assert.deepEqual(growing.update(part), parse(part), `step ${step}, ${end} characters`);
+    }
+  }
+  // What is settled is kept: a long reply costs its tail each time, not the whole of it.
+  const growing = new Growing();
+  const para = 'word '.repeat(40) + '\n\n';
+  growing.update(para.repeat(500) + 'the tail');
+  assert.equal(growing.done, para.length * 500);
+  assert.equal(growing.blocks.length, 500);
+  const before = growing.blocks;
+  const out = growing.update(para.repeat(500) + 'the tail grows');
+  assert.equal(growing.blocks, before);
+  assert.equal(out.length, 501);
+  // Inside an open fence nothing is settled, however many blank lines it holds.
+  const fenced = new Growing();
+  fenced.update('intro\n\n```\na\n\nb\n\nc');
+  assert.equal(fenced.done, 'intro\n\n'.length);
+  // A text that is not a continuation starts over.
+  assert.deepEqual(growing.update('new text'), parse('new text'));
+});
+
 test('an item of the transcript is drawn from its fields as text', () => {
   const posted = [];
   const post = (m) => posted.push(m);
@@ -173,8 +254,12 @@ test('an item of the transcript is drawn from its fields as text', () => {
   assert.ok(picture.textContent.includes('chart.png (5 KB)'));
   const other = page.renderItem(doc, { id: 'i3', kind: 'media', picture: false, name: 'report.pdf', key: 'm2' }, post);
   assert.ok(!other.all().some((n) => n.tag === 'img'));
-  other.all().find((n) => n.tag === 'button').listeners.click();
+  const folder = other.all().find((n) => n.tag === 'button');
+  assert.equal(folder.textContent, 'Show in folder', 'a file that may not be opened says so on its button');
+  folder.listeners.click();
   assert.deepEqual(posted.pop(), { type: 'openMedia', key: 'm2' });
+  const opens = page.renderItem(doc, { id: 'i5', kind: 'media', picture: false, name: 'report.pdf', key: 'm3', opens: true }, post);
+  assert.equal(opens.all().find((n) => n.tag === 'button').textContent, 'Open');
 
   const unknown = page.renderItem(doc, { id: 'i4', kind: 'surprise<script>', text: 'x' }, post);
   assert.equal(unknown.children.length, 0);

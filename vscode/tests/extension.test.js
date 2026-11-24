@@ -417,7 +417,7 @@ test('unsaved text: the agent reads an open file from the editor, and any other 
   assert.match(flat(items().filter((i) => i.kind === 'agent')[1].ast), /read=null/);
 });
 
-test('media: a picture is shown in the chat from the extension\'s own folder; other files get Open, runnable ones do not open', async (t) => {
+test('media: a picture is shown in the chat; only kinds that are merely displayed open, the rest are shown in their folder', async (t) => {
   const { view, items, idle, dir, s } = host(t);
   const picture = path.join(dir, 'chart.png');
   fs.writeFileSync(picture, PNG);
@@ -430,11 +430,18 @@ test('media: a picture is shown in the chat from the extension\'s own folder; ot
   const root = view.webview.options.localResourceRoots[1].path;
   assert.ok(shown.src.startsWith('https://file.example' + root + '/') && shown.src.endsWith('-chart.png'), shown.src);
   assert.ok(fs.readFileSync(shown.src.slice('https://file.example'.length)).equals(PNG));
+  assert.equal(shown.opens, true);
   view.say({ type: 'openMedia', key: shown.key });
   await until(() => s.executed.some((e) => e[0] === 'vscode.open'));
 
+  // A new session clears the transcript, and the files that were shown in it go with it.
+  const kept = shown.src.slice('https://file.example'.length);
   view.say({ type: 'new' });
   await until(() => items().length === 0);
+  await until(() => !fs.existsSync(kept));
+  view.say({ type: 'openMedia', key: shown.key });
+  await new Promise((r) => setTimeout(r, 30));
+  assert.equal(s.executed.filter((e) => e[0] === 'vscode.open').length, 1, 'its key opens nothing any more');
   const script = path.join(dir, 'setup.sh');
   fs.writeFileSync(script, '#!/bin/sh\necho hello from a script that must not run\n');
   view.say({ type: 'send', text: `SHOW ${script} WITHURI` });
@@ -443,9 +450,28 @@ test('media: a picture is shown in the chat from the extension\'s own folder; ot
   const line = items().find((i) => i.kind === 'media');
   assert.equal(line.picture, false);
   assert.equal(line.src, '');
+  assert.equal(line.opens, false);
   view.say({ type: 'openMedia', key: line.key });
-  await until(() => s.messages.some((m) => /may run rather than show/.test(m.text)));
+  await until(() => s.executed.some((e) => e[0] === 'revealFileInOS'));
+  assert.equal(s.executed.find((e) => e[0] === 'revealFileInOS')[1].fsPath, script, 'shown in its folder');
   assert.deepEqual(s.external, [], 'not handed to the system');
+  assert.equal(s.executed.filter((e) => e[0] === 'vscode.open').length, 1, 'and not opened in the editor');
+
+  // A program that calls itself a PDF, and a document with macros: the same.
+  for (const [name, content] of [['invoice.pdf', 'MZ\x90\x00 not a pdf at all'], ['letter.docm', 'PK\x03\x04 macros inside'], ['tool.pyw', 'import os\n']]) {
+    view.say({ type: 'new' });
+    await until(() => items().length === 0);
+    const file = path.join(dir, name);
+    fs.writeFileSync(file, content, 'latin1');
+    const reveals = s.executed.filter((e) => e[0] === 'revealFileInOS').length;
+    view.say({ type: 'send', text: `SHOW ${file} WITHURI` });
+    await until(() => items().some((i) => i.kind === 'media'));
+    await idle();
+    assert.equal(items().find((i) => i.kind === 'media').opens, false, name);
+    view.say({ type: 'openMedia', key: items().find((i) => i.kind === 'media').key });
+    await until(() => s.executed.filter((e) => e[0] === 'revealFileInOS').length === reveals + 1);
+    assert.deepEqual(s.external, [], name);
+  }
 
   view.say({ type: 'new' });
   await until(() => items().length === 0);
@@ -457,6 +483,141 @@ test('media: a picture is shown in the chat from the extension\'s own folder; ot
   view.say({ type: 'openMedia', key: items().find((i) => i.kind === 'media').key });
   await until(() => s.external.length === 1);
   assert.equal(s.external[0], 'file://' + pdf);
+});
+
+test('a text the agent shows that is no file here opens as a read-only document, not as one that wants saving', async (t) => {
+  const { view, items, idle, s } = host(t);
+  const elsewhere = path.join(tempDir(t), 'page.html');
+  fs.writeFileSync(elsewhere, '<script>alert(1)</script>\n');
+  view.say({ type: 'send', text: `SHOWTEXT ${elsewhere}` });
+  await until(() => items().some((i) => i.kind === 'note'));
+  await idle();
+  const [, doc] = s.executed.find((e) => e[0] === 'showTextDocument');
+  assert.equal(doc.uri.scheme, 'llembas-diff', "the extension's own read-only documents");
+  assert.ok(doc.uri.path.endsWith('/page.html'));
+  assert.equal(doc.text, '<script>alert(1)</script>\n');
+  assert.equal(doc.isDirty, false);
+  view.say({ type: 'new' });
+  await until(() => items().length === 0);
+  assert.equal(s.contentProviders.get('llembas-diff').provideTextDocumentContent(doc.uri), '', 'let go with the transcript');
+});
+
+test("the agent's write: put into the open document and saved before the answer; a file not open is left to the agent", async (t) => {
+  const { vscode, view, items, idle, sent, dir, s } = host(t);
+  const open = path.join(dir, 'open.txt');
+  const closed = path.join(dir, 'closed.txt');
+  const other = path.join(dir, 'other.txt');
+  fs.writeFileSync(open, 'on disk\n');
+  fs.writeFileSync(other, 'untouched\n');
+  const editor = vscode.__.open(open, 'typed and not saved\n');
+  const bystander = vscode.__.open(other, 'unsaved here too\n');
+  view.say({ type: 'send', text: `PUT ${open}` });
+  await until(() => items().some((i) => i.kind === 'agent'));
+  await idle();
+  assert.deepEqual(sent().find((m) => m.method === 'initialize').params.clientCapabilities.fs, { readTextFile: true, writeTextFile: true });
+  assert.match(flat(items().find((i) => i.kind === 'agent').ast), /put=client/);
+  assert.equal(editor.document.text, 'put by the agent\n', 'in the document');
+  assert.equal(fs.readFileSync(open, 'utf8'), 'put by the agent\n', 'and on disk');
+  assert.equal(editor.document.isDirty, false);
+  assert.equal(editor.document.saves, 1);
+  assert.equal(bystander.document.text, 'unsaved here too\n', 'no other document is touched');
+  assert.equal(bystander.document.saves, 0);
+  assert.equal(fs.readFileSync(other, 'utf8'), 'untouched\n');
+
+  view.say({ type: 'send', text: `PUT ${closed}` });
+  await until(() => items().filter((i) => i.kind === 'agent').length === 2);
+  await idle();
+  assert.match(flat(items().filter((i) => i.kind === 'agent')[1].ast), /put=disk/);
+  assert.ok(!vscode.workspace.textDocuments.some((d) => d.uri.fsPath === closed), 'nothing was opened for it');
+});
+
+test('the agent\'s write keeps a document\'s own line breaks, and saves a document that already has the text', async (t) => {
+  const { vscode, view, items, idle, dir } = host(t);
+  const file = path.join(dir, 'crlf.txt');
+  fs.writeFileSync(file, 'old\r\n');
+  const editor = vscode.__.open(file, 'old\r\n');
+  editor.document.eol = 2;
+  view.say({ type: 'send', text: `PUT ${file}` });
+  await until(() => items().some((i) => i.kind === 'agent'));
+  await idle();
+  assert.equal(fs.readFileSync(file, 'utf8'), 'put by the agent\r\n');
+  // Typed to exactly the wanted text, not saved: no edit is needed, the save still is.
+  fs.writeFileSync(file, 'stale on disk\r\n');
+  editor.document.isDirty = true;
+  const version = editor.document.version;
+  view.say({ type: 'send', text: `PUT ${file}` });
+  await until(() => items().filter((i) => i.kind === 'agent').length === 2);
+  await idle();
+  assert.equal(editor.document.version, version);
+  assert.equal(fs.readFileSync(file, 'utf8'), 'put by the agent\r\n');
+});
+
+test('two rewrites of one file do not overwrite each other; another file is not held up', async (t) => {
+  const { vscode, run, sent, dir, s } = host(t);
+  const a = vscode.__.open(path.join(dir, 'a.txt'), 'one\ntwo', new vscode.Selection(0, 0, 1, 3));
+  s.inputs.push('SLOWE shout', 'shout again', 'shout');
+  const first = run('llembas.rewrite');
+  await until(() => sent().some((m) => m.method === '_lembas/edit'));
+  await run('llembas.rewrite'); // the same file, while the first is being written
+  assert.match(s.messages.pop().text, /a rewrite of this file is still being written/);
+  assert.equal(s.inputs.length, 2, 'refused before anything was asked');
+  assert.equal(sent().filter((m) => m.method === '_lembas/edit').length, 1);
+  s.inputs.shift();
+  // Another file meanwhile: proposed and accepted while the first still waits.
+  const b = vscode.__.open(path.join(dir, 'b.txt'), 'three', new vscode.Selection(0, 0, 0, 5));
+  await run('llembas.rewrite');
+  assert.equal(s.lensProviders[0].provideCodeLenses(b.document).filter((l) => l.command.title === 'Accept').length, 1);
+  // The other file's change is accepted while the first rewrite is still out.
+  s.cancelProgress = undefined;
+  vscode.window.activeTextEditor = b;
+  await run('llembas.acceptAllChanges');
+  assert.equal(b.document.text, 'THREE');
+  assert.equal(a.document.text, 'one\ntwo');
+  sent(); // (the slow one is still out)
+  vscode.__.commands.get('llembas.restart')();
+  await first;
+  assert.deepEqual(s.lensProviders[0].provideCodeLenses(a.document), []);
+});
+
+test('typing in one file while a change is applied to another is still seen (no one flag for all documents)', async (t) => {
+  const { vscode, run, dir, s } = host(t);
+  const a = vscode.__.open(path.join(dir, 'a.txt'), 'one\ntwo\nthree', new vscode.Selection(0, 0, 2, 5));
+  s.inputs.push('REPLACE ONE\\ntwo\\nTHREE');
+  await run('llembas.rewrite');
+  const b = vscode.__.open(path.join(dir, 'b.txt'), 'four', new vscode.Selection(0, 0, 0, 4));
+  s.inputs.push('shout');
+  await run('llembas.rewrite');
+  const lines = () => s.lensProviders[0].provideCodeLenses(a.document).filter((l) => l.command.title === 'Accept').map((l) => l.range.start.line);
+  assert.deepEqual(lines(), [0, 2]);
+  // While the editor applies b's change, a line is typed at the top of a.
+  const apply = vscode.workspace.applyEdit;
+  vscode.workspace.applyEdit = async (edit) => {
+    a.document.text = 'typed\n' + a.document.text;
+    s.changed.fire({ document: a.document, contentChanges: [{ range: new vscode.Range(0, 0, 0, 0), text: 'typed\n' }] });
+    return apply(edit);
+  };
+  await run('llembas.acceptAllChanges'); // b is in front
+  vscode.workspace.applyEdit = apply;
+  assert.equal(b.document.text, 'FOUR');
+  assert.deepEqual(lines(), [3], "a's remaining change moved down with its line; the one on the line typed into was dropped");
+  vscode.window.activeTextEditor = a;
+  await run('llembas.acceptAllChanges');
+  assert.equal(a.document.text, 'typed\none\ntwo\nTHREE');
+});
+
+test('Stop the Agent lets go of the session at once', async (t) => {
+  const { view, items, idle, run, sent, state } = host(t);
+  view.say({ type: 'send', text: 'hello' });
+  await until(() => items().some((i) => i.kind === 'agent'));
+  await idle();
+  assert.equal(state().session, true);
+  await run('llembas.restart');
+  await until(() => state().session === false);
+  view.say({ type: 'send', text: 'hello again' });
+  await until(() => items().filter((i) => i.kind === 'agent').length === 2);
+  await idle();
+  assert.ok(!items().some((i) => i.kind === 'note' && /failed/.test(i.text)));
+  assert.ok(sent().filter((m) => m.method === 'session/new').length >= 1);
 });
 
 test('media over the limit is refused in words', async (t) => {
