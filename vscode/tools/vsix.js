@@ -50,7 +50,7 @@ function manifestXml(pkg) {
       <Property Id="Microsoft.VisualStudio.Services.GitHubFlavoredMarkdown" Value="true" />
       <Property Id="Microsoft.VisualStudio.Services.Content.Pricing" Value="Free" />
     </Properties>
-    <License>extension/LICENSE.txt</License>
+    <License>extension/LICENSE.txt</License>${pkg.icon ? `\n    <Icon>extension/${xml(pkg.icon)}</Icon>` : ''}
   </Metadata>
   <Installation>
     <InstallationTarget Id="Microsoft.VisualStudio.Code" />
@@ -60,7 +60,7 @@ function manifestXml(pkg) {
     <Asset Type="Microsoft.VisualStudio.Code.Manifest" Path="extension/package.json" Addressable="true" />
     <Asset Type="Microsoft.VisualStudio.Services.Content.Details" Path="extension/README.md" Addressable="true" />
     <Asset Type="Microsoft.VisualStudio.Services.Content.License" Path="extension/LICENSE.txt" Addressable="true" />
-  </Assets>
+${pkg.icon ? `    <Asset Type="Microsoft.VisualStudio.Services.Icons.Default" Path="extension/${xml(pkg.icon)}" Addressable="true" />\n` : ''}  </Assets>
 </PackageManifest>
 `;
 }
@@ -73,6 +73,7 @@ const TYPES = {
   '.md': 'text/markdown',
   '.txt': 'text/plain',
   '.svg': 'image/svg+xml',
+  '.png': 'image/png',
 };
 
 function contentTypesXml(names) {

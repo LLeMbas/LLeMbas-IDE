@@ -4,6 +4,7 @@
   "description": "LLeMbas in your editor: chat with the agent, ask about a selection, have it rewritten as a diff, and autocomplete — a client of the LLeMbas CLI.",
   "version": "0.0.0",
   "publisher": "llembas",
+  "icon": "media/logo.png",
   "license": "MIT",
   "repository": { "type": "git", "url": "https://github.com/LLeMbas/LLeMbas-IDE" },
   "engines": { "vscode": "^1.85.0" },
