@@ -7,7 +7,8 @@ it holds the sign-in to your LLeMbas server, the models, the tools and the permi
 starts `lembas serve --stdio` and talks to it over the Agent Client Protocol. Nothing about a server
 or a model is set in the editor.
 
-This is a beta. It needs LLeMbas CLI 2.0.0-beta.12 or newer, signed in (`lembas login <address>`).
+This is a beta. It needs LLeMbas CLI 2.0.0-beta.14 or newer, signed in (`lembas login <address>`).
+With an older CLI only the chat, asking about a selection and approvals work.
 
 ## Neovim
 
@@ -50,7 +51,7 @@ Help: `:help llembas`.
 While typing, `<Tab>` accepts a suggestion and `<M-\>` asks for one; both keys can be changed in `setup`.
 
 Suggestions, rewrites shown as changes, the model settings and shown files need a LLeMbas CLI with
-harness spec 3.11.0 (after 2.0.0-beta.13). With an older CLI the chat, asking about a selection and
+harness spec 3.11.0 (2.0.0-beta.14 or newer). With an older CLI the chat, asking about a selection and
 approvals work, and a rewrite is done by the agent on the saved file.
 
 Not there yet: picking an older session, and the agent's questions and plans as cards.
