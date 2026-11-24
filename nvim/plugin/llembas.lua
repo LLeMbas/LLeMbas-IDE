@@ -18,3 +18,14 @@ cmd("LLeMbasNew", function() L().new() end, { desc = "LLeMbas: start a new sessi
 cmd("LLeMbasMode", function(o) L().mode(o.args) end,
   { nargs = "?", complete = function() return L().mode_ids() end, desc = "LLeMbas: change the mode" })
 cmd("LLeMbasModel", function(o) L().model(o.args) end, { nargs = "?", desc = "LLeMbas: show or change the model" })
+cmd("LLeMbasAccept", function(o) require("llembas.diff").accept(o.bang) end, { bang = true, desc = "LLeMbas: accept the change under the cursor (! all)" })
+cmd("LLeMbasReject", function(o) require("llembas.diff").reject(o.bang) end, { bang = true, desc = "LLeMbas: reject the change under the cursor (! all)" })
+cmd("LLeMbasAutocomplete", function(o)
+  local on = require("llembas.complete").auto(o.args == "on" and true or o.args == "off" and false or nil)
+  vim.notify("LLeMbas: suggestions as you type are " .. (on and "on" or "off"))
+end, { nargs = "?", complete = function() return { "on", "off" } end, desc = "LLeMbas: suggestions as you type on or off" })
+cmd("LLeMbasAutocompleteModel", function(o) L().autocomplete_model(o.args, o.bang) end,
+  { nargs = "?", bang = true, desc = "LLeMbas: the autocomplete model (! for this editor only, - for the default)" })
+cmd("LLeMbasMainModel", function(o) L().main_model(o.args) end,
+  { nargs = "?", desc = "LLeMbas: the model for chat and rewriting, saved in your account (? shows both)" })
+cmd("LLeMbasOpen", function() L().open_shown() end, { desc = "LLeMbas: open the file the agent showed last" })

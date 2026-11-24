@@ -14,10 +14,17 @@ M.config = {
   model = nil,                            -- the model a session starts on (the CLI's own when nil)
   show_thoughts = false,                  -- the model's thinking in the transcript
   send_open_file = true,                  -- a prompt names the file you are in
+  complete = {
+    auto = true,                          -- suggest as you type (needs an autocomplete model on the server)
+    debounce_ms = 250,                    -- how long you must pause before a suggestion is asked for
+    model = nil,                          -- a quick switch for this editor only; nil: your saved choice
+    accept = "<Tab>",                     -- accepts a shown suggestion; falls through when none is shown
+    trigger = "<M-\\>",                   -- asks for a suggestion now
+  },
 }
 
-local S = { conn = nil, session = nil, starting = nil, busy = false, modes = {}, mode = nil, model = nil,
-            attached = nil, attached_label = nil, last_buf = nil, said = nil }
+local S = { conn = nil, session = nil, starting = nil, connecting = nil, ready = false, caps = {}, busy = false,
+            modes = {}, mode = nil, model = nil, attached = nil, attached_label = nil, last_buf = nil, said = nil }
 
 local function note(text) chat.newline(); chat.append("> " .. text .. "\n") end
 
@@ -74,12 +81,14 @@ local function on_permission(p, reply)
   local meta = (p._meta or {}).lembas or {}
   local options = p.options or {}
   chat.line("ask:" .. tostring(call.toolCallId), "- ? " .. (call.title or meta.tool or "a tool") .. " (waits for your answer)")
+  local preview = require("llembas.diff").preview(call.content)
   local prompt = "LLeMbas asks: " .. (call.title or meta.tool or "a tool")
   if meta.reason then prompt = prompt .. " (" .. meta.reason .. ")" end
   vim.ui.select(options, {
     prompt = prompt:gsub("[\r\n]+", " "):sub(1, 400),
     format_item = function(o) return o.name or o.optionId end,
   }, function(choice)
+    if preview then preview() end
     if not choice then
       chat.line("ask:" .. tostring(call.toolCallId), "- ✗ " .. (call.title or "a tool") .. " (not answered: denied)")
       return reply({ outcome = { outcome = "cancelled" } })
@@ -90,9 +99,11 @@ local function on_permission(p, reply)
 end
 
 local function stopped(code, stderr)
-  local was = S.conn ~= nil or S.starting ~= nil
+  local was = S.session ~= nil or S.starting ~= nil
   local waiting = S.starting
-  S.conn, S.session, S.starting, S.busy = nil, nil, nil, false
+  local connecting = S.connecting
+  S.conn, S.session, S.starting, S.connecting, S.ready, S.busy = nil, nil, nil, nil, false, false
+  for _, cb in ipairs(connecting or {}) do cb(false) end
   if was then
     local last = ""
     for line in (stderr or ""):gmatch("[^\r\n]+") do if line:match("%S") then last = line end end
@@ -102,64 +113,94 @@ local function stopped(code, stderr)
   status()
 end
 
+--- Have a running agent that has answered `initialize`, then call `cb(true)`; `cb(false)` when not.
+--- `quiet`: a failure is not written into the chat (completion asks often and must not nag).
+local function connect(cb, quiet)
+  if S.conn and S.ready then return cb(true) end
+  if S.connecting then S.connecting[#S.connecting + 1] = cb; return end
+  S.connecting = { cb }
+  local function done(ok)
+    local waiting = S.connecting or {}
+    S.connecting = nil
+    for _, f in ipairs(waiting) do f(ok) end
+  end
+  local me = {}
+  local conn, err = rpc.start(M.config.cmd, {
+    notify = function(method, params)
+      if method == "session/update" and params.sessionId == S.session then on_update(params.update or {})
+      elseif method == "_lembas/edit/delta" then require("llembas.diff").delta(params) end
+    end,
+    request = function(method, params, reply)
+      if method == "session/request_permission" then return on_permission(params, reply) end
+      if method == "fs/read_text_file" then return require("llembas.context").read_for_agent(params, reply) end
+      if method == "_lembas/show" then return M._show(params, reply) end
+      reply(nil, { code = -32601, message = "Method not found: " .. method })
+    end,
+    -- Only the agent in use: one that was replaced (a new session) ends later and must not undo its successor.
+    exit = function(code, stderr) if S.conn == me.conn then stopped(code, stderr) end end,
+  }, { cwd = vim.fn.getcwd() })
+  if not conn then
+    if not quiet then note(("Could not start %s: %s"):format(M.config.cmd[1], err)) end
+    S.start_error = ("could not start %s: %s"):format(M.config.cmd[1], err)
+    return done(false)
+  end
+  me.conn = conn
+  S.conn, S.ready, S.start_error = conn, false, nil
+  conn:request("initialize", {
+    protocolVersion = 1,
+    clientCapabilities = { fs = { readTextFile = true, writeTextFile = false },
+      _meta = { lembas = { editor = true, show = true, media = true } } },
+    clientInfo = { name = "llembas.nvim", version = M.version },
+  }, function(e1, r)
+    if S.conn ~= conn then return done(false) end
+    if e1 then
+      if not quiet then note("The agent refused to start: " .. tostring(e1.message)) end
+      S.conn = nil
+      conn:stop()
+      return done(false)
+    end
+    S.ready = true
+    S.caps = {}
+    for _, c in ipairs((((r or {})._meta or {}).lembas or {}).capabilities or {}) do S.caps[c] = true end
+    done(true)
+  end)
+end
+
 --- Have a running agent and an open session, then call `cb(true)`; `cb(false)` when that failed.
 local function ensure(cb)
   if S.session then return cb(true) end
   if S.starting then S.starting[#S.starting + 1] = cb; return end
   S.starting = { cb }
-  local function fail(what)
-    note(what)
-    local conn = S.conn
+  local function finish(ok)
     local waiting = S.starting or {}
-    S.conn, S.starting, S.session = nil, nil, nil
-    if conn then conn:stop() end
-    for _, f in ipairs(waiting) do f(false) end
-  end
-  local conn, err = rpc.start(M.config.cmd, {
-    notify = function(method, params)
-      if method == "session/update" and params.sessionId == S.session then on_update(params.update or {}) end
-    end,
-    request = function(method, params, reply)
-      if method == "session/request_permission" then return on_permission(params, reply) end
-      reply(nil, { code = -32601, message = "Method not found: " .. method })
-    end,
-    exit = stopped,
-  }, { cwd = vim.fn.getcwd() })
-  if not conn then
     S.starting = nil
-    note(("Could not start %s: %s"):format(M.config.cmd[1], err))
-    return cb(false)
+    for _, f in ipairs(waiting) do f(ok) end
   end
-  S.conn = conn
-  conn:request("initialize", { protocolVersion = 1, clientCapabilities = {},
-    clientInfo = { name = "llembas.nvim", version = M.version } }, function(e1)
-    if S.conn ~= conn then return end
-    if e1 then return fail("The agent refused to start: " .. tostring(e1.message)) end
+  connect(function(ok)
+    if not ok then return finish(false) end
+    local conn = S.conn
     local meta = {}
     if M.config.mode then meta.mode = M.config.mode end
     if M.config.model then meta.model = M.config.model end
     conn:request("session/new", { cwd = vim.fn.getcwd(), mcpServers = {}, _meta = meta }, function(e2, r)
-      if S.conn ~= conn then return end
-      if e2 then return fail("No session: " .. tostring(e2.message)) end
+      if S.conn ~= conn then return finish(false) end
+      if e2 then
+        note("No session: " .. tostring(e2.message))
+        return finish(false)
+      end
       S.session = r.sessionId
       S.modes = (r.modes and r.modes.availableModes) or {}
       local lm = (r._meta or {}).lembas or {}
       S.mode = (r.modes and r.modes.currentModeId) or lm.mode
       S.model = lm.model
-      local waiting = S.starting or {}
-      S.starting = nil
       status()
-      for _, f in ipairs(waiting) do f(true) end
+      finish(true)
     end)
   end)
 end
 
 --- Send `blocks` as a prompt; `shown` is what the transcript says you wrote.
-local function send(blocks, shown)
-  if S.busy then
-    vim.notify("LLeMbas is still working on the last message (:LLeMbasStop stops it)", vim.log.levels.WARN)
-    return false
-  end
+local function send(blocks, shown, meta)
   chat.section("You")
   chat.append(shown .. "\n")
   S.said = "you"
@@ -167,7 +208,7 @@ local function send(blocks, shown)
   status()
   ensure(function(ok)
     if not ok then S.busy = false; status(); return end
-    S.conn:request("session/prompt", { sessionId = S.session, prompt = blocks }, function(err, r)
+    S.conn:request("session/prompt", { sessionId = S.session, prompt = blocks, _meta = meta }, function(err, r)
       S.busy = false
       if err then note("The turn failed: " .. tostring(err.message))
       elseif r and r.stopReason and r.stopReason ~= "end_turn" then note("The turn ended: " .. r.stopReason) end
@@ -185,20 +226,35 @@ local function editing_buf()
   if S.last_buf and vim.api.nvim_buf_is_valid(S.last_buf) then return S.last_buf end
 end
 
---- A prompt typed in the panel: with what was attached, or else the name of the open file.
+--- A prompt typed in the panel: with what was attached, or else the name of the open file. An agent
+--- that takes the editor's context as data (`editor`) gets it so; an older one is told in a sentence.
 local function send_typed(text)
-  local blocks, shown = {}, text
-  if S.attached then
-    vim.list_extend(blocks, S.attached)
-    shown = ("[%s]\n%s"):format(S.attached_label, text)
-  elseif M.config.send_open_file and not text:match("^/") then
-    local b = editing_buf()
-    local f = b and context.file(b)
-    if f then blocks[#blocks + 1] = f end
+  if S.busy then
+    vim.notify("LLeMbas is still working on the last message (:LLeMbasStop stops it)", vim.log.levels.WARN)
+    return false
   end
-  blocks[#blocks + 1] = { type = "text", text = text }
-  if send(blocks, shown) == false then return false end
+  local attached, label = S.attached, S.attached_label
   S.attached, S.attached_label = nil, nil
+  S.busy = true
+  connect(function()
+    local blocks, shown, meta = {}, text, nil
+    if attached then
+      shown = ("[%s]\n%s"):format(label, text)
+      if S.caps.editor and attached.editor then meta = { lembas = { editor = attached.editor } }
+      else vim.list_extend(blocks, attached.blocks) end
+    elseif M.config.send_open_file and not text:match("^/") then
+      local b = editing_buf()
+      if b and S.caps.editor then
+        local e = context.editor(b)
+        if e then meta = { lembas = { editor = e } } end
+      else
+        local f = b and context.file(b)
+        if f then blocks[#blocks + 1] = f end
+      end
+    end
+    blocks[#blocks + 1] = { type = "text", text = text }
+    send(blocks, shown, meta)
+  end, true)
   status()
 end
 
@@ -224,14 +280,13 @@ end
 --- the lines are attached to the next message you type.
 function M.ask(first, last, question)
   local buf = vim.api.nvim_get_current_buf()
-  local blocks = context.selection(buf, first, last)
   local what = label(buf, first, last)
+  S.attached = { blocks = context.selection(buf, first, last), editor = context.editor(buf, first, last) }
+  S.attached_label = what
   if question and question:match("%S") then
     M.open(false)
-    blocks[#blocks + 1] = { type = "text", text = question }
-    send(blocks, ("[%s]\n%s"):format(what, question))
+    send_typed(question)
   else
-    S.attached, S.attached_label = blocks, what
     M.open(true)
   end
 end
@@ -243,13 +298,21 @@ function M.edit(first, last, instruction)
   if vim.api.nvim_buf_get_name(buf) == "" or vim.bo[buf].buftype ~= "" then
     return vim.notify("LLeMbas: this buffer is not a file", vim.log.levels.WARN)
   end
-  if vim.bo[buf].modified then
-    return vim.notify("LLeMbas: save the file first (the agent edits the file on disk)", vim.log.levels.WARN)
-  end
   if not instruction or not instruction:match("%S") then
     return vim.ui.input({ prompt = "Rewrite the selection: " }, function(text)
       if text and text:match("%S") then M.edit(first, last, text) end
     end)
+  end
+  if not S.ready then
+    -- Which way a rewrite goes depends on what the agent can do, known once it has started.
+    return connect(function(ok) if ok then M.edit(first, last, instruction) end end)
+  end
+  if S.caps.editor then return require("llembas.diff").rewrite(buf, first, last, instruction) end
+  if vim.bo[buf].modified then
+    return vim.notify("LLeMbas: save the file first (this LLeMbas CLI edits the file on disk)", vim.log.levels.WARN)
+  end
+  if S.busy then
+    return vim.notify("LLeMbas is still working on the last message (:LLeMbasStop stops it)", vim.log.levels.WARN)
   end
   local blocks = context.selection(buf, first, last)
   blocks[#blocks + 1] = { type = "text", text =
@@ -268,7 +331,7 @@ end
 function M.new()
   if S.busy then return vim.notify("LLeMbas is working; stop it first (:LLeMbasStop)", vim.log.levels.WARN) end
   local conn = S.conn
-  S.conn, S.session, S.starting, S.said = nil, nil, nil, nil
+  S.conn, S.session, S.starting, S.connecting, S.ready, S.said = nil, nil, nil, nil, false, nil
   tools = {}
   if conn then conn:stop() end
   chat.clear()
@@ -303,13 +366,116 @@ function M.model(name)
   end)
 end
 
+--- The agent shows a file (the `show` tool). The agent runs on this machine, so the file is opened
+--- from where it is: text in the window you edit in, anything else named in the chat and opened by
+--- the system's own viewer on request. Nothing here is rendered or run.
+function M._show(p, reply)
+  local path = p.uri and vim.uri_to_fname(p.uri) or p.path
+  if type(path) ~= "string" or path == "" then return reply({ shown = false, reason = "no path" }) end
+  if not path:match("^/") then path = vim.fn.getcwd() .. "/" .. path end
+  if vim.fn.filereadable(path) == 0 then return reply({ shown = false, reason = "the editor cannot read that file" }) end
+  local texty = ({ markdown = true, code = true, text = true, html = true, table = true, svg = true, notebook = true })[p.kind or ""]
+  S.shown = path
+  local rel = vim.fn.fnamemodify(path, ":.")
+  if texty then
+    local target
+    for _, w in ipairs(vim.api.nvim_tabpage_list_wins(0)) do
+      if vim.bo[vim.api.nvim_win_get_buf(w)].buftype == "" then target = w break end
+    end
+    if target then
+      vim.api.nvim_win_call(target, function()
+        pcall(vim.cmd, "keepalt edit " .. vim.fn.fnameescape(path))
+        if tonumber(p.line) then pcall(vim.api.nvim_win_set_cursor, 0, { tonumber(p.line), 0 }) end
+      end)
+    end
+    chat.line("show:" .. tostring(p.toolCallId), "- shown: " .. rel)
+  else
+    chat.line("show:" .. tostring(p.toolCallId), ("- shown: %s (%s) — :LLeMbasOpen opens it"):format(rel, tostring(p.kind or "file")))
+  end
+  S.said = "tool"
+  reply({ shown = true })
+end
+
+--- Open the file the agent showed last with the system's viewer.
+function M.open_shown()
+  if not S.shown then return vim.notify("LLeMbas: nothing has been shown yet", vim.log.levels.INFO) end
+  vim.ui.open(S.shown)
+end
+
+local function settings(set, cb)
+  connect(function(ok)
+    if not ok then return end
+    if not S.caps.editor then return vim.notify("LLeMbas: this LLeMbas CLI has no editor settings yet", vim.log.levels.WARN) end
+    S.conn:request("_lembas/editor/settings", set and { set = set } or vim.empty_dict(), function(err, r)
+      if err then return vim.notify("LLeMbas: " .. tostring(err.message), vim.log.levels.ERROR) end
+      cb(r or {})
+    end)
+  end)
+end
+
+local function pick(which, cb)
+  connect(function(ok)
+    if not ok then return end
+    S.conn:request("_lembas/models", vim.empty_dict(), function(err, r)
+      if err then return vim.notify("LLeMbas: " .. tostring(err.message), vim.log.levels.ERROR) end
+      local items = {}
+      for _, m in ipairs((r or {}).models or {}) do
+        if vim.tbl_contains(m["for"] or { "main" }, which) then items[#items + 1] = m end
+      end
+      vim.ui.select(items, { prompt = "LLeMbas " .. which .. " model",
+        format_item = function(m) return m.name and m.name ~= m.id and (m.name .. "  (" .. m.id .. ")") or m.id end },
+        function(m) if m then cb(m.id) end end)
+    end)
+  end)
+end
+
+local function said(r)
+  local a, m = r.autocomplete or {}, r.main or {}
+  vim.notify(("LLeMbas: autocomplete %s%s; main %s"):format(a.model or "not chosen",
+    a.source and (" (" .. a.source .. ")") or "", m.model or "as a session starts"), vim.log.levels.INFO)
+end
+
+--- The model that writes suggestions. No name: pick from the list. `quick`: for this editor only,
+--- not saved; "-" goes back to the saved choice (quick) or to the instance's default (saved).
+function M.autocomplete_model(name, quick)
+  local function set(id)
+    local complete = require("llembas.complete")
+    if quick then
+      M.config.complete.model = id ~= "-" and id or nil
+      complete.reset()
+      return vim.notify("LLeMbas: autocomplete here uses " .. (M.config.complete.model or "your saved choice"), vim.log.levels.INFO)
+    end
+    settings({ autocomplete_model = id ~= "-" and id or vim.NIL }, function(r) complete.reset(); said(r) end)
+  end
+  if name and name ~= "" then return set(name) end
+  pick("autocomplete", set)
+end
+
+--- The model for chat, rewriting and generating, saved in your account.
+function M.main_model(name)
+  local function set(id) settings({ main_model = id ~= "-" and id or vim.NIL }, said) end
+  if name == "?" then return settings(nil, said) end
+  if name and name ~= "" then return set(name) end
+  pick("main", set)
+end
+
 function M.mode_ids()
   return vim.tbl_map(function(m) return m.id end, S.modes)
 end
 
 function M.setup(opts)
   M.config = vim.tbl_deep_extend("force", M.config, opts or {})
-  if type(M.config.cmd) == "string" then M.config.cmd = { M.config.cmd, "serve", "--stdio" } end
+  if type(M.config.cmd) == "string" then M.config.cmd = { M.config.cmd, "serve", "--stdio" } end  require("llembas.complete").setup()
+end
+
+--- For the plugin's other parts: the connection once the agent has started (`cb(conn | nil)`).
+function M._connect(cb, quiet)
+  connect(function(ok) cb(ok and S.conn or nil) end, quiet)
+end
+
+function M._note(text)
+  M.open(false)
+  note(text)
 end
 
 M.version = "1.0.0-beta.1"

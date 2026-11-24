@@ -33,7 +33,12 @@ vim-plug: `Plug 'LLeMbas/LLeMbas-IDE', { 'branch': 'dev', 'rtp': 'nvim' }`
 |---|---|
 | `:LLeMbas` | open or close the chat panel |
 | `:'<,'>LLeMbasAsk [question]` | ask about the selected lines; without a question they go with the next message |
-| `:'<,'>LLeMbasEdit [instruction]` | have the selected lines rewritten (the file must be saved) |
+| `:'<,'>LLeMbasEdit [instruction]` | have the selected lines rewritten; shown as changes to accept (`ga`, `gA`) or reject (`gr`, `gR`) |
+| `:LLeMbasAccept[!]`, `:LLeMbasReject[!]` | the same from the command line (`!`: all) |
+| `:LLeMbasAutocomplete [on\|off]` | suggestions as you type |
+| `:LLeMbasAutocompleteModel[!] [model]` | the model that writes suggestions (`!`: this editor only; `-`: back to the default) |
+| `:LLeMbasMainModel [model]` | the model for chat and rewriting, saved in your account (`?` shows both) |
+| `:LLeMbasOpen` | open the file the agent showed last |
 | `:LLeMbasStop` | stop the running turn |
 | `:LLeMbasNew` | start a new session |
 | `:LLeMbasMode [mode]` | change the mode |
@@ -42,8 +47,13 @@ vim-plug: `Plug 'LLeMbas/LLeMbas-IDE', { 'branch': 'dev', 'rtp': 'nvim' }`
 In the prompt: Enter (normal mode) or Ctrl-S sends, Ctrl-C stops the turn, `q` closes the panel.
 Help: `:help llembas`.
 
-Not there yet: completion as you type, a rewrite shown as a diff you accept or reject, picking an
-older session. In this version the agent changes files on disk itself, under the CLI's permissions.
+While typing, `<Tab>` accepts a suggestion and `<M-\>` asks for one; both keys can be changed in `setup`.
+
+Suggestions, rewrites shown as changes, the model settings and shown files need a LLeMbas CLI with
+harness spec 3.11.0 (after 2.0.0-beta.13). With an older CLI the chat, asking about a selection and
+approvals work, and a rewrite is done by the agent on the saved file.
+
+Not there yet: picking an older session, and the agent's questions and plans as cards.
 
 ## Tests
 

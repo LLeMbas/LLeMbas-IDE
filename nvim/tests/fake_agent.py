@@ -38,6 +38,27 @@ def ask(method, params):
     return waiting.pop(rid)[1]
 
 
+EDITOR = os.environ.get("FAKE_EDITOR") == "1"
+SETTINGS = {"autocomplete": {"model": None, "source": None}, "main": {"model": None}}
+gone = set()
+
+
+def complete(msg):
+    p = msg["params"]
+    prefix = p["prefix"]
+    if "NOMODEL" in prefix:
+        out({"jsonrpc": "2.0", "id": msg["id"], "error": {"code": -32602, "message": "no autocomplete model is chosen"}})
+        return
+    if "SLOWC" in prefix:
+        for _ in range(40):
+            if p.get("id") in gone:
+                out({"jsonrpc": "2.0", "id": msg["id"], "result": {"text": "", "cancelled": True}})
+                return
+            threading.Event().wait(0.05)
+    text = "tail()\n    second line" if "TWO" in prefix else "<" + prefix[-3:] + "|" + (p.get("suffix") or "")[:3] + ">"
+    out({"jsonrpc": "2.0", "id": msg["id"], "result": {"text": text, "model": p.get("model") or "example/model-a", "finish": "stop"}})
+
+
 def prompt(msg):
     p = msg["params"]
     session = p["sessionId"]
@@ -55,6 +76,28 @@ def prompt(msg):
         got = (answer or {}).get("outcome", {})
         update(session, {"sessionUpdate": "agent_message_chunk",
                          "content": {"type": "text", "text": "\nanswer=" + str(got.get("optionId") or got.get("outcome"))}})
+    if "PERMDIFF" in text:
+        answer = ask("session/request_permission", {
+            "sessionId": session,
+            "toolCall": {"toolCallId": "diff-" + str(msg["id"]), "title": "edit sample.py", "kind": "edit", "status": "pending",
+                         "rawInput": {}, "content": [{"type": "diff", "path": "sample.py", "oldText": "one\ntwo", "newText": "one\nTWO"}]},
+            "options": [{"optionId": "once", "name": "Allow once", "kind": "allow_once"},
+                        {"optionId": "deny", "name": "Deny", "kind": "reject_once"}]})
+        got = (answer or {}).get("outcome", {})
+        update(session, {"sessionUpdate": "agent_message_chunk",
+                         "content": {"type": "text", "text": "\nanswer=" + str(got.get("optionId") or got.get("outcome"))}})
+    if "READ " in text:
+        path = text.split("READ ", 1)[1].split()[0]
+        answer = ask("fs/read_text_file", {"sessionId": session, "path": path})
+        update(session, {"sessionUpdate": "agent_message_chunk",
+                         "content": {"type": "text", "text": "\nread=" + json.dumps((answer or {}).get("content"))}})
+    if "SHOW " in text:
+        path = text.split("SHOW ", 1)[1].split()[0]
+        kind = "image" if path.endswith(".png") else "code"
+        answer = ask("_lembas/show", {"sessionId": session, "toolCallId": "show-" + str(msg["id"]), "path": os.path.basename(path),
+                                       "uri": "file://" + path, "kind": kind, "line": 2})
+        update(session, {"sessionUpdate": "agent_message_chunk",
+                         "content": {"type": "text", "text": "\nshown=" + json.dumps(answer)}})
     if "WRITE " in text:
         path = text.split("WRITE ", 1)[1].split()[0]
         update(session, {"sessionUpdate": "tool_call", "toolCallId": "c1", "title": "edit " + os.path.basename(path),
@@ -88,7 +131,37 @@ def main():
                 entry[1] = msg.get("result")
                 entry[0].set()
         elif method == "initialize":
-            out({"jsonrpc": "2.0", "id": msg["id"], "result": {"protocolVersion": 1, "agentCapabilities": {}}})
+            result = {"protocolVersion": 1, "agentCapabilities": {}}
+            if EDITOR:
+                result["_meta"] = {"lembas": {"capabilities": ["editor", "media"]}}
+            out({"jsonrpc": "2.0", "id": msg["id"], "result": result})
+        elif method == "_lembas/complete":
+            threading.Thread(target=complete, args=(msg,), daemon=True).start()
+        elif method == "_lembas/complete/cancel":
+            gone.add(msg["params"]["id"])
+        elif method == "_lembas/edit":
+            p = msg["params"]
+            if "REFUSE" in p["instruction"]:
+                out({"jsonrpc": "2.0", "id": msg["id"], "error": {"code": -32602, "message": "no model to rewrite with"}})
+                continue
+            out({"jsonrpc": "2.0", "method": "_lembas/edit/delta", "params": {"id": p.get("id"), "delta": "abc"}})
+            lines = p["text"].split("\n")
+            if "SAME" in p["instruction"]:
+                new = lines
+            else:
+                # The first line rewritten, a line added after the second, the rest as it was.
+                new = [lines[0].upper()] + lines[1:2] + ["    # added by the rewrite"] + lines[2:]
+            out({"jsonrpc": "2.0", "id": msg["id"], "result": {"text": "\n".join(new), "model": "example/model-a"}})
+        elif method == "_lembas/models":
+            out({"jsonrpc": "2.0", "id": msg["id"], "result": {"models": [
+                {"id": "example/model-a", "name": "Model A", "for": ["main", "autocomplete"]},
+                {"id": "example/model-b", "name": "Model B", "for": ["main"]}],
+                "autocomplete": SETTINGS["autocomplete"], "main": SETTINGS["main"]}})
+        elif method == "_lembas/editor/settings":
+            for key, value in (msg["params"].get("set") or {}).items():
+                which = "autocomplete" if key == "autocomplete_model" else "main"
+                SETTINGS[which] = {"model": value, "source": "person" if value else None}
+            out({"jsonrpc": "2.0", "id": msg["id"], "result": SETTINGS})
         elif method == "session/new":
             out({"jsonrpc": "2.0", "id": msg["id"], "result": {
                 "sessionId": "ses_test",

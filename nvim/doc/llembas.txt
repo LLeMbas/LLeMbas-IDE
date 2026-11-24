@@ -17,9 +17,30 @@ COMMANDS                                                    *llembas-commands*
     Without a question the lines are attached to the next message you type.
 
 :[range]LLeMbasEdit [instruction]                               *:LLeMbasEdit*
-    Have the lines of [range] rewritten. The agent changes the file on disk
-    under the CLI's permissions, so the buffer must be saved first; it is
-    reloaded when the agent is done.
+    Have the lines of [range] rewritten. The result is shown in place as
+    changes: old lines marked, new lines beside them. Nothing is written
+    until you accept. ga accepts the change under the cursor, gr rejects it,
+    gA and gR do all. (With a LLeMbas CLI older than harness spec 3.11.0 the
+    agent edits the saved file on disk instead.)
+
+:LLeMbasAccept[!]  :LLeMbasReject[!]            *:LLeMbasAccept* *:LLeMbasReject*
+    Accept or reject the change under the cursor; with ! all of them.
+
+:LLeMbasAutocomplete [on|off]                           *:LLeMbasAutocomplete*
+    Suggestions as you type. While typing, <Tab> accepts a shown suggestion
+    and <M-\> asks for one now.
+
+:LLeMbasAutocompleteModel[!] [model]               *:LLeMbasAutocompleteModel*
+    The model that writes suggestions, saved in your account; without a name,
+    pick from the list. With ! it is switched for this editor only. "-" goes
+    back to the default.
+
+:LLeMbasMainModel [model]                                  *:LLeMbasMainModel*
+    The model for chat and rewriting, saved in your account. "?" shows both
+    settings.
+
+:LLeMbasOpen                                                    *:LLeMbasOpen*
+    Open the file the agent showed last with the system's viewer.
 
 :LLeMbasStop                                                    *:LLeMbasStop*
     Stop the running turn.
@@ -43,6 +64,13 @@ SETUP                                                          *llembas-setup*
       model = nil,             -- the model a session starts on
       show_thoughts = false,   -- the model's thinking in the transcript
       send_open_file = true,   -- a typed message names the file you are in
+      complete = {
+        auto = true,           -- suggest as you type
+        debounce_ms = 250,     -- the pause before a suggestion is asked for
+        model = nil,           -- a model for this editor only
+        accept = "<Tab>",      -- accepts a shown suggestion
+        trigger = "<M-\\>",    -- asks for a suggestion now
+      },
     })
 <
 What the model writes is shown as text. It is never run, and the panel's
