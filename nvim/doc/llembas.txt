@@ -1,0 +1,51 @@
+*llembas.txt*    LLeMbas in Neovim
+
+The agent is the LLeMbas CLI. This plugin starts `lembas serve --stdio` and is its
+client; the sign-in, the models, the tools and the permissions are the CLI's.
+
+==============================================================================
+COMMANDS                                                    *llembas-commands*
+
+:LLeMbas                                                            *:LLeMbas*
+    Open or close the chat panel: the transcript, and the prompt under it.
+    In the prompt, <CR> in normal mode or <C-s> sends, <C-c> stops the turn,
+    q closes the panel.
+
+:[range]LLeMbasAsk [question]                                    *:LLeMbasAsk*
+    Ask about the lines of [range]. They are sent as the buffer has them,
+    saved or not, with the file, the line numbers and the diagnostics on them.
+    Without a question the lines are attached to the next message you type.
+
+:[range]LLeMbasEdit [instruction]                               *:LLeMbasEdit*
+    Have the lines of [range] rewritten. The agent changes the file on disk
+    under the CLI's permissions, so the buffer must be saved first; it is
+    reloaded when the agent is done.
+
+:LLeMbasStop                                                    *:LLeMbasStop*
+    Stop the running turn.
+
+:LLeMbasNew                                                      *:LLeMbasNew*
+    Start a new session. The old one stays in the CLI's store.
+
+:LLeMbasMode [mode]                                             *:LLeMbasMode*
+    Change the session's mode; without an argument, pick from a list.
+
+:LLeMbasModel [model]                                          *:LLeMbasModel*
+    Show the session's model, or change it to one your server serves.
+
+==============================================================================
+SETUP                                                          *llembas-setup*
+>lua
+    require("llembas").setup({
+      cmd = { "lembas", "serve", "--stdio" },  -- the agent
+      width = 64,              -- the panel's columns
+      mode = nil,              -- the mode a session starts in
+      model = nil,             -- the model a session starts on
+      show_thoughts = false,   -- the model's thinking in the transcript
+      send_open_file = true,   -- a typed message names the file you are in
+    })
+<
+What the model writes is shown as text. It is never run, and the panel's
+buffers read no modeline.
+
+ vim:tw=78:ts=8:ft=help:norl:
