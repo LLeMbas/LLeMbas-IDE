@@ -91,6 +91,19 @@ def prompt(msg):
         answer = ask("fs/read_text_file", {"sessionId": session, "path": path})
         update(session, {"sessionUpdate": "agent_message_chunk",
                          "content": {"type": "text", "text": "\nread=" + json.dumps((answer or {}).get("content"))}})
+    if "PUT " in text:
+        path = text.split("PUT ", 1)[1].split()[0]
+        with lock:
+            next_id[0] += 1
+            rid = next_id[0]
+        done = threading.Event()
+        waiting[rid] = [done, "error"]
+        out({"jsonrpc": "2.0", "id": rid, "method": "fs/write_text_file",
+             "params": {"sessionId": session, "path": path, "content": "written by the agent\nsecond\n"}})
+        done.wait(10)
+        got = waiting.pop(rid)[1]
+        update(session, {"sessionUpdate": "agent_message_chunk",
+                         "content": {"type": "text", "text": "\nput=" + ("error" if got == "error" else "ok")}})
     if "SHOW " in text:
         path = text.split("SHOW ", 1)[1].split()[0]
         kind = "image" if path.endswith(".png") else "code"
@@ -128,7 +141,8 @@ def main():
         if method is None:
             entry = waiting.get(msg.get("id"))
             if entry:
-                entry[1] = msg.get("result")
+                if "error" not in msg:
+                    entry[1] = msg.get("result")
                 entry[0].set()
         elif method == "initialize":
             result = {"protocolVersion": 1, "agentCapabilities": {}}

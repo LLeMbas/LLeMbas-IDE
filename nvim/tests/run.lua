@@ -64,9 +64,9 @@ check("prompt: the open file is named, its text is not sent",
 local init
 for _, m in ipairs(sent()) do if m.method == "initialize" then init = m end end
 local lm = init and (init.params.clientCapabilities._meta or {}).lembas or {}
-check("start: ACP version 1, and the client says it is an editor that shows files and serves unsaved text",
+check("start: ACP version 1, and the client says it is an editor that shows files and serves and takes text",
   init and init.params.protocolVersion == 1 and lm.editor == true and lm.media == true
-  and init.params.clientCapabilities.fs.readTextFile == true and init.params.clientCapabilities.fs.writeTextFile == false)
+  and init.params.clientCapabilities.fs.readTextFile == true and init.params.clientCapabilities.fs.writeTextFile == true)
 check("start: the transcript cannot be typed in and reads no modeline",
   vim.bo[chat.tbuf].modifiable == false and vim.bo[chat.tbuf].modeline == false and vim.bo[chat.ibuf].modeline == false)
 
@@ -97,12 +97,14 @@ check("attach: the next message carries them no more", #p == 2 and p[2].text == 
 
 -- 4. An approval is put to the person; the answer goes back.
 local asked
-vim.ui.select = function(items, opts, cb) asked = { items = items, opts = opts }; cb(items[1]) end
+local function option(items, id) for _, o in ipairs(items) do if o.optionId == id then return o end end end
+vim.ui.select = function(items, opts, cb) asked = { items = items, opts = opts }; cb(option(items, "once")) end
 type_and_send("PERM")
 idle()
 check("approval: asked with the command and the reason",
   asked and asked.opts.prompt:find("rm -r build", 1, true) and asked.opts.prompt:find("deletes files", 1, true)
-  and asked.opts.format_item(asked.items[2]) == "Deny")
+  and asked.opts.format_item(asked.items[1]) == "Deny")
+check("approval: the first choice is a denial, so a stray 1 and Enter allows nothing", asked.items[1].optionId == "deny")
 check("approval: the choice reaches the agent", chat.text():find("answer=once", 1, true) ~= nil, chat.text())
 vim.ui.select = function(_, _, cb) cb(nil) end
 type_and_send("PERM")
@@ -231,6 +233,48 @@ vim.cmd("1,2LLeMbasEdit REFUSE")
 check("rewrite: a refusal is said in the agent's words", wait(function() return table.concat(said_msgs, "|"):find("no model to rewrite with", 1, true) ~= nil end)
   and D.pending(fbuf) == 0)
 
+-- A change whose lines you removed meanwhile takes nothing else with it.
+vim.api.nvim_buf_set_lines(fbuf, 0, -1, false, { "def a():", "    return 1", "keep me", "and me" })
+vim.cmd("1,2LLeMbasEdit once more")
+wait(function() return D.pending(fbuf) == 2 end)
+vim.api.nvim_buf_set_lines(fbuf, 0, 1, false, {})
+vim.api.nvim_win_set_cursor(0, { 1, 0 })
+vim.cmd("LLeMbasAccept!")
+check("rewrite: a change whose line you deleted is dropped, and no other line is taken",
+  D.pending(fbuf) == 0 and vim.deep_equal(vim.api.nvim_buf_get_lines(fbuf, 0, -1, false),
+    { "    return 1", "    # added by the rewrite", "keep me", "and me" }),
+  vim.inspect(vim.api.nvim_buf_get_lines(fbuf, 0, -1, false)))
+-- The keys of a proposal are yours again afterwards.
+vim.keymap.set("n", "ga", "<Cmd>let g:mine = 1<CR>", { buffer = fbuf })
+vim.cmd("1,1LLeMbasEdit keys")
+wait(function() return D.pending(fbuf) > 0 end)
+vim.cmd("LLeMbasReject!")
+check("rewrite: a buffer mapping the proposal's keys replaced is given back",
+  vim.fn.maparg("ga", "n", false, true).rhs == "<Cmd>let g:mine = 1<CR>", vim.inspect(vim.fn.maparg("ga", "n", false, true)))
+vim.keymap.del("n", "ga", { buffer = fbuf })
+
+-- The agent's read never takes a file for another whose name merely begins the same.
+local short = tmp .. "/sample"
+vim.fn.writefile({ "the short one" }, short)
+vim.api.nvim_set_current_win(vim.fn.bufwinid(chat.ibuf))
+type_and_send("READ " .. short)
+idle()
+check("unsaved: a file is found by its whole name, not by a part of another's",
+  chat.text():find('read="the short one"', 1, true) ~= nil, chat.text())
+-- A write by the agent goes into the open buffer and onto the disk together.
+vim.api.nvim_buf_set_lines(fbuf, 0, -1, false, { "old text, not saved" })
+type_and_send("PUT " .. file)
+idle()
+check("write: the agent's text is in the buffer, on the disk, and the buffer is not left modified",
+  vim.deep_equal(vim.api.nvim_buf_get_lines(fbuf, 0, -1, false), { "written by the agent", "second" })
+  and vim.deep_equal(vim.fn.readfile(file), { "written by the agent", "second" }) and not vim.bo[fbuf].modified
+  and chat.text():find("put=ok", 1, true) ~= nil, chat.text())
+type_and_send("PUT " .. tmp .. "/not-open.txt")
+idle()
+check("write: a file that is not open is left to the agent", chat.text():find("put=error", 1, true) ~= nil
+  and vim.fn.filereadable(tmp .. "/not-open.txt") == 0)
+vim.api.nvim_set_current_win(vim.fn.bufwinid(fbuf))
+
 -- An approval that carries a diff shows it while the question is open.
 local wins_during
 vim.ui.select = function(items, _, cb)
@@ -239,7 +283,7 @@ vim.ui.select = function(items, _, cb)
     local b = vim.api.nvim_win_get_buf(w)
     if vim.bo[b].filetype == "diff" then wins_during = vim.api.nvim_buf_get_lines(b, 0, -1, false) end
   end
-  cb(items[2])
+  cb(option(items, "deny"))
 end
 local wins_before = #vim.api.nvim_tabpage_list_wins(0)
 vim.api.nvim_set_current_win(vim.fn.bufwinid(chat.ibuf))
@@ -262,6 +306,10 @@ check("show: a file that is not text is named in the chat and answered as shown"
   chat.text():find("chart.png (image)", 1, true) ~= nil and chat.text():find('shown={"shown": true}', 1, true) ~= nil, chat.text())
 vim.cmd("LLeMbasOpen")
 check("show: :LLeMbasOpen hands it to the system's viewer", opened == png)
+L._state.shown = tmp .. "/run.desktop"
+opened = nil
+vim.cmd("LLeMbasOpen")
+check("show: a file that may run is not handed to the system", opened == nil)
 local other = tmp .. "/other.py"
 vim.fn.writefile({ "x = 1", "y = 2", "z = 3" }, other)
 type_and_send("SHOW " .. other)
@@ -302,6 +350,18 @@ check("suggest: accepting puts it in and moves the cursor to its end",
   and vim.deep_equal(vim.api.nvim_win_get_cursor(0), { 2, 3 }) and ghost(obuf) == nil,
   vim.inspect(vim.api.nvim_buf_get_lines(obuf, 0, -1, false)))
 check("suggest: with nothing shown there is nothing to accept", C.accept() == false)
+vim.keymap.set("i", "<Tab>", "<Cmd>let g:tab = 1<CR>", { buffer = obuf })
+vim.api.nvim_buf_set_lines(obuf, 0, -1, false, { "abc" })
+vim.api.nvim_win_set_cursor(0, { 1, 3 })
+C.request(true)
+wait(function() return ghost(obuf) ~= nil end)
+local during = vim.fn.maparg("<Tab>", "i", false, true)
+C.clear()
+local after = vim.fn.maparg("<Tab>", "i", false, true)
+check("suggest: Tab is the plugin's only while a suggestion is shown, and yours again afterwards",
+  during.desc == "LLeMbas: accept the suggestion" and after.rhs == "<Cmd>let g:tab = 1<CR>", vim.inspect({ during.desc, after.rhs }))
+vim.keymap.del("i", "<Tab>", { buffer = obuf })
+check("suggest: without a suggestion the plugin maps Tab nowhere", vim.fn.maparg("<Tab>", "i") == "")
 -- As you type: asked after the pause, and an answer for a place you have left is not drawn.
 L.config.complete.debounce_ms = 30
 vim.api.nvim_buf_set_lines(obuf, 0, -1, false, { "" })

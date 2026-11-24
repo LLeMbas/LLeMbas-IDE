@@ -8,8 +8,13 @@ local proposals = {} -- buf -> list of pending hunks { mark, old_count, new, abo
 
 local function count(buf) return #(proposals[buf] or {}) end
 
+local KEYS = { "ga", "gr", "gA", "gR" }
+local saved = {} -- buf -> the buffer mappings these keys had before
+
 local function unmap(buf)
-  for _, k in ipairs({ "ga", "gr", "gA", "gR" }) do pcall(vim.keymap.del, "n", k, { buffer = buf }) end
+  for _, k in ipairs(KEYS) do pcall(vim.keymap.del, "n", k, { buffer = buf }) end
+  for _, before in ipairs(saved[buf] or {}) do pcall(vim.fn.mapset, "n", false, before) end
+  saved[buf] = nil
 end
 
 local function drop(buf, hunk)
@@ -29,10 +34,17 @@ local function row_of(buf, hunk)
 end
 
 local function apply(buf, hunk)
-  local row = row_of(buf, hunk)
+  local pos = vim.api.nvim_buf_get_extmark_by_id(buf, ns, hunk.mark, { details = true })
+  local row = pos[1]
   if not row then return drop(buf, hunk) end
   if hunk.old_count > 0 then
-    vim.api.nvim_buf_set_lines(buf, row, row + hunk.old_count, false, hunk.new)
+    -- What the mark covers now, not what it covered when shown: lines you removed since are not removed twice.
+    local last = (pos[3] or {}).end_row or row
+    if last <= row then
+      drop(buf, hunk)
+      return vim.notify("LLeMbas: the lines of that change are gone; it was dropped", vim.log.levels.WARN)
+    end
+    vim.api.nvim_buf_set_lines(buf, row, last, false, hunk.new)
   elseif hunk.above then
     vim.api.nvim_buf_set_lines(buf, row, row, false, hunk.new)
   else
@@ -116,12 +128,24 @@ function M.propose(buf, first, last, new)
     end
     table.insert(proposals[buf], hunk)
   end
+  if not saved[buf] then
+    saved[buf] = {}
+    for _, k in ipairs(KEYS) do
+      local before = vim.fn.maparg(k, "n", false, true)
+      if next(before) and before.buffer == 1 then table.insert(saved[buf], before) end
+    end
+  end
   local function map(k, fn, desc) vim.keymap.set("n", k, fn, { buffer = buf, desc = desc, nowait = true }) end
   map("ga", function() M.accept(false) end, "LLeMbas: accept this change")
   map("gr", function() M.reject(false) end, "LLeMbas: reject this change")
   map("gA", function() M.accept(true) end, "LLeMbas: accept all changes")
   map("gR", function() M.reject(true) end, "LLeMbas: reject all changes")
   return #hunks
+end
+
+--- A buffer was reloaded from disk: what was proposed for its old text is void.
+function M.forget(buf)
+  for _, h in ipairs(vim.list_slice(proposals[buf] or {})) do drop(buf, h) end
 end
 
 local written = 0
@@ -172,7 +196,7 @@ function M.preview(content)
   local out = {}
   for _, c in ipairs(content or {}) do
     if type(c) == "table" and c.type == "diff" and type(c.newText) == "string" then
-      out[#out + 1] = "--- " .. tostring(c.path or "?")
+      out[#out + 1] = "--- " .. (tostring(c.path or "?"):gsub("[\r\n]+", " "))
       local d = vim.diff((c.oldText or "") .. "\n", c.newText .. "\n", { result_type = "unified", ctxlen = 3 })
       vim.list_extend(out, vim.split(d ~= "" and d or "(no change)", "\n", { plain = true, trimempty = true }))
     end

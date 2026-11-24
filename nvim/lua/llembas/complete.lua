@@ -14,8 +14,18 @@ local function L() return require("llembas") end
 --- insert mode in a headless run, can say yes.
 function M._typing() return vim.api.nvim_get_mode().mode:sub(1, 1) == "i" end
 
+--- The accept key is ours only while a suggestion is on the screen: a buffer mapping put there with
+--- the suggestion and taken away with it, whatever was mapped before given back as it was.
+local function unmap_accept()
+  local s = st.shown
+  if not s or not s.key then return end
+  pcall(vim.keymap.del, "i", s.key, { buffer = s.buf })
+  if s.before and next(s.before) and s.before.buffer == 1 then pcall(vim.fn.mapset, "i", false, s.before) end
+end
+
 function M.clear()
   if st.shown then
+    unmap_accept()
     pcall(vim.api.nvim_buf_del_extmark, st.shown.buf, ns, st.shown.mark)
     st.shown = nil
   end
@@ -37,7 +47,13 @@ local function show(buf, row, col, text)
     opts.virt_lines = {}
     for i = 2, #lines do opts.virt_lines[#opts.virt_lines + 1] = { { lines[i], "Comment" } } end
   end
-  st.shown = { buf = buf, row = row, col = col, text = text, mark = vim.api.nvim_buf_set_extmark(buf, ns, row, col, opts) }
+  st.shown = { buf = buf, text = text, mark = vim.api.nvim_buf_set_extmark(buf, ns, row, col, opts) }
+  local key = L().config.complete.accept
+  if key and key ~= "" then
+    local before = vim.fn.maparg(key, "i", false, true)
+    st.shown.key, st.shown.before = key, before
+    vim.keymap.set("i", key, function() M.accept() end, { buffer = buf, nowait = true, desc = "LLeMbas: accept the suggestion" })
+  end
 end
 
 local function usable(buf)
@@ -64,6 +80,8 @@ function M.request(manual)
   L()._connect(function(conn)
     if seq ~= st.seq then return end
     if not conn then
+      -- An agent that does not start is not started again at every pause: once a minute at most.
+      st.wait_until = vim.uv.now() + 60000
       if manual then vim.notify("LLeMbas: " .. (L()._state.start_error or "the agent did not start"), vim.log.levels.WARN) end
       return
     end
@@ -104,12 +122,16 @@ end
 function M.accept()
   local s = st.shown
   if not s or s.buf ~= vim.api.nvim_get_current_buf() then return false end
+  -- Where the suggestion stands now: its mark moves with the text around it.
+  local pos = vim.api.nvim_buf_get_extmark_by_id(s.buf, ns, s.mark, {})
   M.clear()
   st.seq = st.seq + 1
+  if not pos[1] then return false end
+  local at_row, at_col = pos[1], pos[2]
   local lines = vim.split(s.text, "\n", { plain = true })
-  vim.api.nvim_buf_set_text(s.buf, s.row, s.col, s.row, s.col, lines)
-  local row = s.row + #lines
-  local col = #lines == 1 and (s.col + #lines[1]) or #lines[#lines]
+  vim.api.nvim_buf_set_text(s.buf, at_row, at_col, at_row, at_col, lines)
+  local row = at_row + #lines
+  local col = #lines == 1 and (at_col + #lines[1]) or #lines[#lines]
   vim.api.nvim_win_set_cursor(0, { row, col })
   return true
 end
@@ -130,7 +152,7 @@ function M.reset() st.off, st.said = nil, false end
 local function typed()
   M.clear()
   local c = L().config.complete
-  if not c.auto or st.off then return cancel() end
+  if not c.auto or st.off or (st.wait_until and vim.uv.now() < st.wait_until) then return cancel() end
   if not usable(vim.api.nvim_get_current_buf()) then return end
   cancel()
   st.timer = st.timer or vim.uv.new_timer()
@@ -144,13 +166,6 @@ function M.setup()
   vim.api.nvim_create_autocmd({ "TextChangedI", "CursorMovedI" }, { group = group, callback = typed })
   vim.api.nvim_create_autocmd({ "InsertLeave", "BufLeave" }, { group = group, callback = function() M.clear(); cancel() end })
   local c = L().config.complete
-  if c.accept and c.accept ~= "" then
-    vim.keymap.set("i", c.accept, function()
-      if not M.accept() then
-        vim.api.nvim_feedkeys(vim.api.nvim_replace_termcodes(c.accept, true, false, true), "n", false)
-      end
-    end, { desc = "LLeMbas: accept the suggestion" })
-  end
   if c.trigger and c.trigger ~= "" then
     vim.keymap.set("i", c.trigger, function() M.request(true) end, { desc = "LLeMbas: suggest here" })
   end

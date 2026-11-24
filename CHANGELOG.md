@@ -27,7 +27,21 @@
 - The editor's context (file, cursor, selection, diagnostics) goes to the agent as data.
 - These need a LLeMbas CLI with harness spec 3.11.0. With an older one the plugin works as before.
 
+- The agent's write to a file that is open here goes into the buffer and is saved at once, so the
+  buffer and the disk never part.
+- `<Tab>` is the plugin's only while a suggestion is on the screen; whatever you had mapped to it
+  is yours the rest of the time. The same holds for `ga`, `gr`, `gA`, `gR` and a shown rewrite.
+- An approval lists the refusal first, so a digit and Enter typed while the question opens allows
+  nothing.
+- `:LLeMbasOpen` hands the system only files that are looked at or listened to, never one that may run.
+- `:LLeMbasNew!` ends an agent whose turn hangs.
+
 ### Fixed (Neovim)
+
+- A file the agent asked for could be answered from another open file whose name began the same.
+- Accepting a change after deleting one of its lines removed a line that was not part of it.
+- A reloaded file kept the changes proposed for its old text.
+- An agent that does not start was started again at every typing pause.
 
 - Starting a new session could leave the plugin believing the new agent had stopped.
 

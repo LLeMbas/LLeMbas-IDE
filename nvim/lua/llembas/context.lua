@@ -75,14 +75,46 @@ function M.editor(buf, first, last)
   return out
 end
 
+--- The loaded buffer that holds exactly this file, or nil. By the full name, never by a pattern:
+--- `README` must not find `README.md`.
+function M.buffer_of(path)
+  local want = vim.fs.normalize(vim.fn.fnamemodify(path, ":p"))
+  for _, b in ipairs(vim.api.nvim_list_bufs()) do
+    if vim.api.nvim_buf_is_loaded(b) and vim.bo[b].buftype == "" then
+      local name = vim.api.nvim_buf_get_name(b)
+      if name ~= "" and vim.fs.normalize(name) == want then return b end
+    end
+  end
+end
+
+--- The agent writes a file (ACP `fs/write_text_file`): one that is open here gets the text in its
+--- buffer and is saved at once, so the buffer and the disk agree when the agent is answered. A file
+--- that is not open is refused, and the agent writes the disk itself.
+function M.write_for_agent(params, reply)
+  local path, content = params.path, params.content
+  if type(path) ~= "string" or type(content) ~= "string" then return reply(nil, { code = -32602, message = "no path or no text" }) end
+  local buf = M.buffer_of(path)
+  if not buf then return reply(nil, { code = -32002, message = "not open in the editor" }) end
+  if not vim.bo[buf].modifiable or vim.bo[buf].readonly then
+    return reply(nil, { code = -32002, message = "the editor holds that file read-only" })
+  end
+  local lines = vim.split((content:gsub("\r\n", "\n")), "\n", { plain = true })
+  if lines[#lines] == "" and #lines > 1 then table.remove(lines) end
+  vim.api.nvim_buf_set_lines(buf, 0, -1, false, lines)
+  -- Saved as it is: no autocommand (a formatter) may change what the agent believes it wrote.
+  local ok, err = pcall(vim.api.nvim_buf_call, buf, function() vim.cmd("silent noautocmd write!") end)
+  if not ok then return reply(nil, { code = -32002, message = "the editor could not save it: " .. tostring(err) }) end
+  reply(vim.NIL)
+end
+
 --- The agent asks for a file's text (ACP `fs/read_text_file`): a file open here is answered from its
 --- buffer, saved or not, so the agent sees what you see. Anything else is read from disk.
 function M.read_for_agent(params, reply)
   local path = params.path
   if type(path) ~= "string" or path == "" then return reply(nil, { code = -32602, message = "no path" }) end
   local lines
-  local buf = vim.fn.bufnr(path)
-  if buf ~= -1 and vim.api.nvim_buf_is_loaded(buf) and vim.bo[buf].buftype == "" then
+  local buf = M.buffer_of(path)
+  if buf then
     lines = vim.api.nvim_buf_get_lines(buf, 0, -1, false)
   else
     local ok, read = pcall(vim.fn.readfile, path)

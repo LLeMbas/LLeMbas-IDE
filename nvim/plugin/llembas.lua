@@ -14,7 +14,7 @@ cmd("LLeMbasAsk", function(o) L().ask(o.line1, o.line2, o.args) end,
 cmd("LLeMbasEdit", function(o) L().edit(o.line1, o.line2, o.args) end,
   { range = true, nargs = "*", desc = "LLeMbas: have the selected lines rewritten" })
 cmd("LLeMbasStop", function() L().stop() end, { desc = "LLeMbas: stop the running turn" })
-cmd("LLeMbasNew", function() L().new() end, { desc = "LLeMbas: start a new session" })
+cmd("LLeMbasNew", function(o) L().new(o.bang) end, { bang = true, desc = "LLeMbas: start a new session (! also while a turn hangs)" })
 cmd("LLeMbasMode", function(o) L().mode(o.args) end,
   { nargs = "?", complete = function() return L().mode_ids() end, desc = "LLeMbas: change the mode" })
 cmd("LLeMbasModel", function(o) L().model(o.args) end, { nargs = "?", desc = "LLeMbas: show or change the model" })

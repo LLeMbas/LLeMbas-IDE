@@ -84,6 +84,15 @@ local function on_permission(p, reply)
   local preview = require("llembas.diff").preview(call.content)
   local prompt = "LLeMbas asks: " .. (call.title or meta.tool or "a tool")
   if meta.reason then prompt = prompt .. " (" .. meta.reason .. ")" end
+  -- The refusals first: the question can open while you are typing, and a digit and Enter meant for
+  -- your code must not allow a command. The first choice is always a denial.
+  options = vim.list_slice(options)
+  table.sort(options, function(x, y)
+    local dx, dy = tostring(x.kind):match("^reject") and 0 or 1, tostring(y.kind):match("^reject") and 0 or 1
+    return dx < dy
+  end)
+  pcall(vim.cmd, "stopinsert")
+  pcall(vim.cmd, "redraw")
   vim.ui.select(options, {
     prompt = prompt:gsub("[\r\n]+", " "):sub(1, 400),
     format_item = function(o) return o.name or o.optionId end,
@@ -134,6 +143,7 @@ local function connect(cb, quiet)
       if method == "session/request_permission" then return on_permission(params, reply) end
       if method == "fs/read_text_file" then return require("llembas.context").read_for_agent(params, reply) end
       if method == "_lembas/show" then return M._show(params, reply) end
+      if method == "fs/write_text_file" then return require("llembas.context").write_for_agent(params, reply) end
       reply(nil, { code = -32601, message = "Method not found: " .. method })
     end,
     -- Only the agent in use: one that was replaced (a new session) ends later and must not undo its successor.
@@ -148,7 +158,7 @@ local function connect(cb, quiet)
   S.conn, S.ready, S.start_error = conn, false, nil
   conn:request("initialize", {
     protocolVersion = 1,
-    clientCapabilities = { fs = { readTextFile = true, writeTextFile = false },
+    clientCapabilities = { fs = { readTextFile = true, writeTextFile = true },
       _meta = { lembas = { editor = true, show = true, media = true } } },
     clientInfo = { name = "llembas.nvim", version = M.version },
   }, function(e1, r)
@@ -328,8 +338,11 @@ function M.stop()
 end
 
 --- A new session; the old one stays in the CLI's store.
-function M.new()
-  if S.busy then return vim.notify("LLeMbas is working; stop it first (:LLeMbasStop)", vim.log.levels.WARN) end
+function M.new(force)
+  if S.busy and not force then
+    return vim.notify("LLeMbas is working; stop it first (:LLeMbasStop), or :LLeMbasNew! to end the agent", vim.log.levels.WARN)
+  end
+  S.busy = false
   local conn = S.conn
   S.conn, S.session, S.starting, S.connecting, S.ready, S.said = nil, nil, nil, nil, false, nil
   tools = {}
@@ -397,8 +410,18 @@ function M._show(p, reply)
 end
 
 --- Open the file the agent showed last with the system's viewer.
+-- What the system's viewer is given: files that are only looked at or listened to. Anything else
+-- (a script, a page, a shortcut, a document that can carry macros) is named and left alone.
+local VIEWED = {}
+for _, e in ipairs({ "png", "jpg", "jpeg", "gif", "webp", "avif", "bmp", "pdf", "mp3", "wav", "ogg", "oga", "flac", "m4a",
+  "mp4", "webm", "mkv", "mov", "glb", "gltf", "obj", "stl", "csv", "tsv", "txt" }) do VIEWED[e] = true end
+
 function M.open_shown()
   if not S.shown then return vim.notify("LLeMbas: nothing has been shown yet", vim.log.levels.INFO) end
+  local ext = (S.shown:match("%.([%w]+)$") or ""):lower()
+  if not VIEWED[ext] then
+    return vim.notify("LLeMbas: not opened, since a file of that kind may run: " .. S.shown, vim.log.levels.WARN)
+  end
   vim.ui.open(S.shown)
 end
 
@@ -484,6 +507,10 @@ M._state = S -- for the tests
 vim.api.nvim_create_autocmd("VimLeavePre", {
   group = vim.api.nvim_create_augroup("llembas", { clear = true }),
   callback = function() if S.conn then S.conn:stop() end end,
+})
+vim.api.nvim_create_autocmd({ "FileChangedShellPost", "BufReadPost" }, {
+  group = "llembas",
+  callback = function(ev) require("llembas.diff").forget(ev.buf) end,
 })
 vim.api.nvim_create_autocmd("BufEnter", {
   group = "llembas",
