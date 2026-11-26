@@ -1,5 +1,27 @@
 # Changelog
 
+## [1.0.0-beta.2] — 2026-11-26
+
+### Added (VS Code / VSCodium & Neovim)
+
+- **Full agentic workflows (protocol 2):** interactive Question cards
+  (`_lembas/question`), Plan approval cards (`_lembas/plan`), detailed live plan
+  progress, live phase status, live mid-run mode switching, and mid-run steering
+  (`_lembas/steer`).
+- **Session-aware prefilled autocomplete:** sends workspace `cwd`, `sessionId`,
+  and open buffer snippets on `_lembas/complete`, and pre-warms the CLI's file
+  index and direct imports on tab/buffer switch (`_lembas/complete/warm`).
+- **Project file index & navigation:** `@file` search popup in VS Code chat,
+  clickable `file:line` references (VS Code chat + `<CR>`/`gf` in Neovim chat),
+  project file index commands (`llembas.openFile`, `llembas.addFile`,
+  `:LLeMbasFiles`, `:LLeMbasOpenFile`), and `_lembas/show` text fallback & line
+  range reveal.
+- **Session resume & coding actions:** resume previous sessions with full
+  transcript replay (`llembas.resumeSession`, `:LLeMbasSessions`), plus
+  `llembas.explain` / `:LLeMbasExplain`, `llembas.fixProblems` / `:LLeMbasFix`,
+  `llembas.generate`, `/` slash command completion, and multi-root workspace
+  detection.
+
 ## [1.0.0-beta.1] — 2026-11-24
 
 ### Neovim plugin
