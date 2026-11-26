@@ -287,6 +287,15 @@ test('the page: a strict policy, one script with a nonce, nothing from elsewhere
   assert.ok(!/\son[a-z]+=/.test(html), 'no inline handlers');
   assert.ok(!/style=/.test(html), 'no inline styles');
   assert.throws(() => chatHtml({ cspSource: 'x', nonce: 'a"b', scriptUri: 's', styleUri: 't' }));
+  // Real VSCodium passes space-separated CSP sources (e.g. "vscode-resource: https://*.vscode-cdn.net").
+  const multi = chatHtml({
+    cspSource: 'vscode-resource: https://file+.vscode-resource.vscode-cdn.net',
+    nonce: 'abc123',
+    scriptUri: 'https://file.example/media/chat.js',
+    styleUri: 'https://file.example/media/chat.css',
+  });
+  assert.ok(multi.includes('style-src vscode-resource: https://file+.vscode-resource.vscode-cdn.net;'));
+  assert.throws(() => chatHtml({ cspSource: "https://a.example; script-src 'unsafe-inline'", nonce: 'abc', scriptUri: 's', styleUri: 't' }));
 });
 
 test('the stylesheet takes every colour from the editor\'s theme', () => {

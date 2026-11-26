@@ -1,5 +1,16 @@
 # Changelog
 
+## [1.0.0-beta.3] — 2026-11-26
+
+### Fixed (VS Code / VSCodium)
+
+- **Chat sidebar view loads cleanly in VSCodium.** Allowed space-separated
+  multi-origin `webview.cspSource` values (such as
+  `vscode-resource: https://*.vscode-cdn.net`) in `src/webview.js` instead of
+  throwing `unsafe value for the chat page` (which caused VSCodium to display
+  `An error occurred while loading view: llembas.chat`), while still blocking
+  CSP injection characters (`"`, `<`, `>`, `;`, newlines).
+
 ## [1.0.0-beta.2] — 2026-11-26
 
 ### Added (VS Code / VSCodium & Neovim)

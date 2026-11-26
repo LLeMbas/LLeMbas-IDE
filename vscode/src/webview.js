@@ -7,8 +7,13 @@
  * @param {{ cspSource: string, nonce: string, scriptUri: string, styleUri: string }} o
  */
 function chatHtml(o) {
-  for (const v of [o.cspSource, o.nonce, o.scriptUri, o.styleUri]) {
-    if (typeof v !== 'string' || /["<>\s]/.test(v)) throw new Error('unsafe value for the chat page');
+  // VS Code / VSCodium's `webview.cspSource` may list multiple space-separated origins
+  // (e.g. "vscode-resource: https://*.vscode-cdn.net"); forbid quotes, angle brackets, semicolons and newlines.
+  if (typeof o.cspSource !== 'string' || !o.cspSource.trim() || /["<>;\r\n]/.test(o.cspSource)) {
+    throw new Error('unsafe cspSource for the chat page');
+  }
+  for (const v of [o.nonce, o.scriptUri, o.styleUri]) {
+    if (typeof v !== 'string' || !v || /["<>\s]/.test(v)) throw new Error('unsafe value for the chat page');
   }
   const csp = [
     "default-src 'none'",

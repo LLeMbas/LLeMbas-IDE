@@ -735,7 +735,7 @@ function M._note(text)
   note(text)
 end
 
-M.version = "1.0.0-beta.2"
+M.version = "1.0.0-beta.3"
 M._state = S -- for the tests
 
 vim.api.nvim_create_autocmd("VimLeavePre", {
