@@ -28,10 +28,14 @@ function config() {
   return vscode.workspace.getConfiguration('llembas');
 }
 
-/** The folder the agent works in: the first folder of the window, else the open file's, else home. */
+/** The folder the agent works in: the active editor's workspace folder, else the first folder of the window, else the open file's, else home. */
 function workingDirectory() {
-  for (const f of vscode.workspace.workspaceFolders || []) if (f.uri.scheme === 'file') return f.uri.fsPath;
   const active = vscode.window.activeTextEditor;
+  if (active && active.document.uri.scheme === 'file' && typeof vscode.workspace.getWorkspaceFolder === 'function') {
+    const folder = vscode.workspace.getWorkspaceFolder(active.document.uri);
+    if (folder && folder.uri.scheme === 'file') return folder.uri.fsPath;
+  }
+  for (const f of vscode.workspace.workspaceFolders || []) if (f.uri.scheme === 'file') return f.uri.fsPath;
   if (active && active.document.uri.scheme === 'file') return path.dirname(active.document.uri.fsPath);
   return os.homedir();
 }
@@ -407,10 +411,25 @@ class ChatView {
       case 'send':
         if (typeof m.text === 'string' && m.text.trim() && m.text.length <= 1000000) a.sendTyped(m.text);
         return undefined;
+      case 'steer':
+        if (typeof m.text === 'string' && m.text.trim() && m.text.length <= 1000000) a.guard(this.chat.steer(m.text));
+        return undefined;
       case 'stop':
         return this.chat.stop();
       case 'new':
         return a.newSession();
+      case 'sessions':
+        return a.guard(a.resumeSession());
+      case 'addFile':
+        return a.guard(a.addFile());
+      case 'searchFiles':
+        if (typeof m.query === 'string') {
+          const seq = m.seq;
+          a.searchFiles(m.query)
+            .then((files) => this.post({ type: 'files', seq, files }))
+            .catch(() => this.post({ type: 'files', seq, files: [] }));
+        }
+        return undefined;
       case 'detach':
         return this.attach(null);
       case 'setMode':
@@ -422,6 +441,15 @@ class ChatView {
       case 'answer':
         if (typeof m.card === 'string' && typeof m.option === 'string') this.chat.answer(m.card, m.option);
         return undefined;
+      case 'answerQuestion':
+        if (typeof m.card === 'string' && Array.isArray(m.answers)) this.chat.answerQuestion(m.card, m.answers);
+        return undefined;
+      case 'dismissQuestion':
+        if (typeof m.card === 'string') this.chat.dismissQuestion(m.card);
+        return undefined;
+      case 'answerPlan':
+        if (typeof m.card === 'string' && typeof m.outcome === 'string') this.chat.answerPlan(m.card, m.outcome, m.value);
+        return undefined;
       case 'showDiff':
         if (typeof m.card === 'string') this.chat.reshow(m.card);
         return undefined;
@@ -432,8 +460,8 @@ class ChatView {
         return undefined;
       }
       case 'openFile':
-        if (typeof m.path === 'string' && path.isAbsolute(m.path)) {
-          vscode.window.showTextDocument(vscode.Uri.file(m.path), { preview: true }).then(undefined, (e) => vscode.window.showWarningMessage(say(e)));
+        if (typeof m.path === 'string' && m.path.trim()) {
+          a.openFileAt(m.path.trim(), m.line, !!m.soft);
         }
         return undefined;
       case 'openMedia':
@@ -544,8 +572,11 @@ function activate(context) {
           texts.set(uri, String(p.text));
         }
         const doc = await vscode.workspace.openTextDocument(uri);
-        const at = new vscode.Position(Math.min(line, doc.lineCount - 1), 0);
-        await vscode.window.showTextDocument(doc, { preview: true, preserveFocus: true, selection: new vscode.Range(at, at) });
+        const startLine = Math.min(line, Math.max(0, doc.lineCount - 1));
+        const endLine = Number.isInteger(p.endLine) && p.endLine > 0 ? Math.min(p.endLine - 1, Math.max(0, doc.lineCount - 1)) : startLine;
+        const startPos = new vscode.Position(startLine, 0);
+        const endPos = endLine > startLine ? doc.lineAt(endLine).range.end : startPos;
+        await vscode.window.showTextDocument(doc, { preview: true, preserveFocus: true, selection: new vscode.Range(startPos, endPos) });
         return { shown: true };
       } catch (e) {
         return { shown: false, reason: 'The editor could not open it: ' + e.message };
@@ -611,11 +642,93 @@ function activate(context) {
 
   // ---- the chat ----
 
+  function openFileAt(rawPath, line, soft) {
+    const resolved = path.isAbsolute(rawPath) ? rawPath : path.resolve(workingDirectory(), rawPath);
+    if (soft && !fs.existsSync(resolved)) return undefined;
+    const uri = vscode.Uri.file(resolved);
+    const opts = { preview: true };
+    if (Number.isInteger(line) && line > 0) {
+      const pos = new vscode.Position(line - 1, 0);
+      opts.selection = new vscode.Range(pos, pos);
+    }
+    return vscode.window.showTextDocument(uri, opts).then(undefined, (e) => {
+      if (!soft) vscode.window.showWarningMessage(say(e));
+    });
+  }
+
+  async function searchProjectFiles(query) {
+    const fromAgent = await chat.searchFiles(query, 40).catch(() => []);
+    if (fromAgent.length) return fromAgent;
+    const root = workingDirectory();
+    const openRel = [];
+    for (const d of vscode.workspace.textDocuments) {
+      if (d.uri.scheme !== 'file') continue;
+      const rel = path.relative(root, d.uri.fsPath).replace(/\\/g, '/');
+      if (rel && !rel.startsWith('..') && (!query || rel.toLowerCase().includes(query.toLowerCase()))) openRel.push(rel);
+    }
+    return [...new Set(openRel)];
+  }
+
+  async function pickProjectFile(title) {
+    const files = await searchProjectFiles('');
+    if (!files.length) {
+      vscode.window.showInformationMessage('LLeMbas: no files found in the project index.');
+      return undefined;
+    }
+    const picked = await vscode.window.showQuickPick(
+      files.map((f) => ({ label: f })),
+      { title, placeHolder: 'Type to filter project files' },
+    );
+    return picked ? picked.label : undefined;
+  }
+
+  async function openIndexedFile() {
+    const rel = await pickProjectFile('LLeMbas: open file from project index');
+    if (rel) await openFileAt(rel);
+  }
+
+  async function addFileToChat() {
+    const rel = await pickProjectFile('LLeMbas: add file to chat');
+    if (!rel) return;
+    await view.reveal(true);
+    view.post({ type: 'insertText', text: `@${rel} ` });
+  }
+
+  async function resumeSession() {
+    if (chat.busy) return vscode.window.showWarningMessage('LLeMbas is working. Stop it first.');
+    let list;
+    try {
+      list = await chat.listSessions(40);
+    } catch (e) {
+      return vscode.window.showErrorMessage(say(e));
+    }
+    if (!list.length) return vscode.window.showInformationMessage('LLeMbas: no previous sessions in this folder.');
+    const picked = await vscode.window.showQuickPick(
+      list.map((s) => ({
+        label: String(s.title || s.id),
+        description: [s.model || '', s.updated ? new Date(s.updated).toISOString().slice(0, 16).replace('T', ' ') : ''].filter(Boolean).join(' · '),
+        id: s.id,
+      })),
+      { title: 'LLeMbas: resume a previous session', placeHolder: 'Choose a session' },
+    );
+    if (!picked) return undefined;
+    await view.reveal(true);
+    await chat.resumeSession(picked.id);
+    return undefined;
+  }
+
   const actions = {
     mediaDir,
     guard,
+    openFileAt,
+    searchFiles: searchProjectFiles,
+    resumeSession,
+    addFile: addFileToChat,
     async sendTyped(text) {
-      if (chat.busy) return vscode.window.showWarningMessage('LLeMbas is still working on the last message. Stop it first.');
+      if (chat.busy) {
+        if (chat.has('steer')) return chat.steer(text);
+        return vscode.window.showWarningMessage('LLeMbas is still working on the last message. Stop it first.');
+      }
       let w = view.attached;
       if (!w && config().get('chat.sendEditorContext') && !text.startsWith('/')) w = seen(vscode.window.activeTextEditor, false);
       view.attach(null);
@@ -648,7 +761,9 @@ function activate(context) {
 
   // A card must be seen to be answered: the view is brought forward when one arrives.
   chat.on('item', (item) => {
-    if (item.kind === 'card' && item.state === 'open') view.reveal(false, true).then(undefined, () => {});
+    if ((item.kind === 'card' || item.kind === 'question' || item.kind === 'plancard') && item.state === 'open') {
+      view.reveal(false, true).then(undefined, () => {});
+    }
   });
 
   async function ask() {
@@ -664,6 +779,76 @@ function activate(context) {
     if (!question.trim()) return view.attach(w);
     if (chat.busy) return vscode.window.showWarningMessage('LLeMbas is still working on the last message. Stop it first.');
     return chat.send(question, { editor: w.editor, label: w.label });
+  }
+
+  async function explain() {
+    const editor = vscode.window.activeTextEditor;
+    const w = seen(editor, true);
+    if (!w) return vscode.window.showInformationMessage('LLeMbas: select the code you want explained first.');
+    await view.reveal(false);
+    if (chat.busy) return vscode.window.showWarningMessage('LLeMbas is still working on the last message. Stop it first.');
+    return chat.send('Explain the selected code concisely, including any subtle behavior or edge cases.', { editor: w.editor, label: w.label });
+  }
+
+  async function fixProblems() {
+    const editor = vscode.window.activeTextEditor;
+    if (!editor) return vscode.window.showInformationMessage('LLeMbas: open a file with problems first.');
+    const w = seen(editor, false);
+    if (!w || !w.editor || !w.editor.diagnostics || !w.editor.diagnostics.length) {
+      return vscode.window.showInformationMessage('LLeMbas: no warnings or errors reported in this file.');
+    }
+    await view.reveal(false);
+    if (chat.busy) return vscode.window.showWarningMessage('LLeMbas is still working on the last message. Stop it first.');
+    return chat.send('Fix the reported diagnostics in this file.', { editor: w.editor, label: w.label });
+  }
+
+  async function generateAtCursor() {
+    const editor = vscode.window.activeTextEditor;
+    if (!editor) return vscode.window.showInformationMessage('LLeMbas: open an editor first.');
+    const doc = editor.document;
+    const line = editor.selection.active.line;
+    const instruction = await vscode.window.showInputBox({
+      title: 'Generate code at cursor',
+      placeHolder: 'Describe the code to write here',
+    });
+    if (!instruction || !instruction.trim()) return undefined;
+    if (proposals.pending(doc)) return vscode.window.showWarningMessage('LLeMbas: accept or reject the changes shown in this file first.');
+    if (!(await chat.connect(false))) return vscode.window.showErrorMessage(say(chat.startError || 'the agent did not start'));
+    if (!chat.has('editor')) return vscode.window.showWarningMessage('LLeMbas: this LLeMbas CLI cannot rewrite/generate yet. Update the CLI.');
+    const lines = (from, to) => {
+      const out = [];
+      for (let i = Math.max(0, from); i <= Math.min(doc.lineCount - 1, to); i++) out.push(doc.lineAt(i).text);
+      return out;
+    };
+    const old = [doc.lineAt(line).text];
+    const versionThen = doc.version;
+    const id = 'e' + ++rewrites;
+    const params = {
+      id,
+      cwd: workingDirectory(),
+      text: old.join('\n') || ' ',
+      before: lines(line - 40, line - 1).join('\n'),
+      after: lines(line + 1, line + 40).join('\n'),
+      language: doc.languageId,
+      instruction: `At this line, ${instruction.trim()}`,
+    };
+    if (doc.uri.scheme === 'file') params.path = doc.uri.fsPath;
+    if (chat.session) params.sessionId = chat.session;
+    if (windowModel.main) params.model = windowModel.main;
+    let r;
+    try {
+      r = await chat.request('_lembas/edit', params);
+    } catch (e) {
+      return vscode.window.showErrorMessage(say(e));
+    }
+    if (!r || r.cancelled || typeof r.text !== 'string' || doc.isClosed || doc.version !== versionThen) return undefined;
+    const fresh = hunksOf.splitLines(r.text);
+    if (fresh.length > 1 && fresh[fresh.length - 1] === '') fresh.pop();
+    const hunks = hunksOf.propose(line, old, fresh);
+    if (!hunks.length) return undefined;
+    proposals.set(doc, hunks);
+    if (config().get('rewrite.openDiff')) proposals.showDiff(doc).then(undefined, () => {});
+    return undefined;
   }
 
   // ---- rewrite a selection ----
@@ -796,7 +981,32 @@ function activate(context) {
       if (manual) vscode.window.showWarningMessage(say(message));
     },
   });
-  chat.on('connected', () => completer.unblock());
+  function openSnippets(excludeDoc) {
+    const out = [];
+    for (const d of vscode.workspace.textDocuments) {
+      if (out.length >= 6) break;
+      if (d === excludeDoc || d.isClosed || d.uri.scheme !== 'file') continue;
+      const text = d.getText();
+      if (!text || text.length > 32768) continue;
+      out.push({ path: d.uri.fsPath, text });
+    }
+    return out;
+  }
+
+  function warmActiveEditor(editor) {
+    if (!editor || !editor.document || editor.document.uri.scheme !== 'file') return;
+    completer.warm({
+      cwd: workingDirectory(),
+      sessionId: chat.session || undefined,
+      path: editor.document.uri.fsPath,
+      text: editor.document.getText().slice(0, 32768),
+    });
+  }
+
+  chat.on('connected', () => {
+    completer.unblock();
+    warmActiveEditor(vscode.window.activeTextEditor);
+  });
 
   const inline = {
     async provideInlineCompletionItems(document, position, ctx, token) {
@@ -809,8 +1019,17 @@ function activate(context) {
       const around = document.getText(new vscode.Range(from, to));
       const { prefix, suffix } = windowAround(around, offset - document.offsetAt(from));
       if (!manual && !prefix.trim() && !suffix.trim()) return undefined;
+      const open = openSnippets(document);
       const asked = completer.ask(
-        { prefix, suffix, path: document.uri.scheme === 'file' ? document.uri.fsPath : undefined, language: document.languageId },
+        {
+          prefix,
+          suffix,
+          path: document.uri.scheme === 'file' ? document.uri.fsPath : undefined,
+          language: document.languageId,
+          cwd: workingDirectory(),
+          sessionId: chat.session || undefined,
+          open: open.length ? open : undefined,
+        },
         { manual },
       );
       const seq = completer.current;
@@ -935,11 +1154,17 @@ function activate(context) {
   const command = (name, fn) => context.subscriptions.push(vscode.commands.registerCommand(name, (...args) => guard(Promise.resolve().then(() => fn(...args)))));
   command('llembas.open', () => view.reveal(true));
   command('llembas.newSession', actions.newSession);
+  command('llembas.resumeSession', resumeSession);
   command('llembas.stop', () => chat.stop());
   command('llembas.restart', () => chat.stopAgent());
   command('llembas.ask', ask);
+  command('llembas.explain', explain);
+  command('llembas.fixProblems', fixProblems);
+  command('llembas.generate', generateAtCursor);
   command('llembas.rewrite', rewrite);
   command('llembas.complete', () => vscode.commands.executeCommand('editor.action.inlineSuggest.trigger'));
+  command('llembas.openFile', openIndexedFile);
+  command('llembas.addFile', addFileToChat);
   command('llembas.chooseMode', chooseMode);
   command('llembas.chooseModel', chooseSessionModel);
   command('llembas.modelSettings', modelSettings);
@@ -975,9 +1200,10 @@ function activate(context) {
     vscode.workspace.onDidChangeTextDocument((ev) => proposals.documentChanged(ev)),
     vscode.workspace.onDidCloseTextDocument((doc) => proposals.clear(doc)),
     vscode.window.onDidChangeVisibleTextEditors((editors) => editors.forEach((e) => proposals.decorate(e))),
-    vscode.window.onDidChangeActiveTextEditor((e) =>
-      vscode.commands.executeCommand('setContext', 'llembas.hasProposal', !!(e && proposals.pending(e.document))),
-    ),
+    vscode.window.onDidChangeActiveTextEditor((e) => {
+      vscode.commands.executeCommand('setContext', 'llembas.hasProposal', !!(e && proposals.pending(e.document)));
+      warmActiveEditor(e);
+    }),
     vscode.workspace.onDidChangeConfiguration((ev) => {
       // Another command for the agent: the running one is stopped, and the next request starts the new one.
       if (ev.affectsConfiguration('llembas.command')) chat.stopAgent();

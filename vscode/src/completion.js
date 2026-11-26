@@ -38,6 +38,7 @@ class Completer {
     this.pending = null; // { seq, timer, id, sent, finish }
     this.blocked = ''; // the refusal that stopped asking as you type
     this.pausedUntil = 0;
+    this.lastWarmed = '';
     this.setTimeout = io.setTimeout || setTimeout;
     this.clearTimeout = io.clearTimeout || clearTimeout;
     this.now = io.now || Date.now;
@@ -80,6 +81,10 @@ class Completer {
     const params = { id: entry.id, prefix: what.prefix, suffix: what.suffix || '' };
     if (what.path) params.path = what.path;
     if (what.language) params.language = what.language;
+    if (what.cwd) params.cwd = what.cwd;
+    if (what.sessionId) params.sessionId = what.sessionId;
+    if (Array.isArray(what.open) && what.open.length) params.open = what.open;
+    if (Array.isArray(what.context) && what.context.length) params.context = what.context;
     const model = this.io.model ? this.io.model() : undefined;
     if (model) params.model = model;
     const maxTokens = this.io.maxTokens ? this.io.maxTokens() : undefined;
@@ -132,6 +137,21 @@ class Completer {
   unblock() {
     this.blocked = '';
     this.pausedUntil = 0;
+    this.lastWarmed = '';
+  }
+
+  /** Pre-warm the CLI's session file index & direct imports for a file before the person pauses typing. */
+  warm(what) {
+    if (!what || (!what.cwd && !what.sessionId)) return;
+    const key = `${what.sessionId || ''}|${what.cwd || ''}|${what.path || ''}`;
+    if (key === this.lastWarmed) return;
+    this.lastWarmed = key;
+    const params = {};
+    if (what.cwd) params.cwd = what.cwd;
+    if (what.sessionId) params.sessionId = what.sessionId;
+    if (what.path) params.path = what.path;
+    if (typeof what.text === 'string' && what.text.length <= 65536) params.text = what.text;
+    this.io.notify('_lembas/complete/warm', params);
   }
 }
 

@@ -94,9 +94,10 @@ class Agent extends EventEmitter {
             // Unsaved text: reading always; writing only where the editor can put the text into the
             // open document and save it before it answers.
             fs: { readTextFile: true, writeTextFile: !!o.writeTextFile },
+            // `protocol: 2` enables `_lembas/question`, `_lembas/plan`, and `_lembas/event`.
             // `show` with `media`: the spec offers the show tool to a client that says `show`,
             // and hands over files that are not text to one that also says `media`.
-            _meta: { lembas: { editor: true, media: true, show: true } },
+            _meta: { lembas: { protocol: 2, editor: true, media: true, show: true } },
           },
           clientInfo: o.clientInfo || { name: 'llembas-vscode', version: '0' },
         })

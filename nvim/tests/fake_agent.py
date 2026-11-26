@@ -118,6 +118,24 @@ def prompt(msg):
         with open(path, "w") as f:
             f.write("rewritten by the agent\n")
         update(session, {"sessionUpdate": "tool_call_update", "toolCallId": "c1", "status": "completed"})
+    if "QUESTION" in text:
+        answer = ask("_lembas/question", {
+            "sessionId": session,
+            "toolCallId": "q-" + str(msg["id"]),
+            "why": "Pick a backend",
+            "questions": [{"header": "DB", "question": "Which DB?", "options": [{"label": "SQLite"}, {"label": "Postgres"}]}],
+        })
+        update(session, {"sessionUpdate": "agent_message_chunk",
+                         "content": {"type": "text", "text": "\nquestion=" + json.dumps(answer, sort_keys=True)}})
+    if "PLANCARD" in text:
+        answer = ask("_lembas/plan", {
+            "sessionId": session,
+            "toolCallId": "p-" + str(msg["id"]),
+            "text": "# Plan\n- step 1",
+            "plan": {"title": "Upgrade"},
+        })
+        update(session, {"sessionUpdate": "agent_message_chunk",
+                         "content": {"type": "text", "text": "\nplan=" + json.dumps(answer, sort_keys=True)}})
     if "CRASH" in text:
         sys.stderr.write("not signed in: run lembas login\n")
         sys.stderr.flush()
@@ -147,12 +165,29 @@ def main():
         elif method == "initialize":
             result = {"protocolVersion": 1, "agentCapabilities": {}}
             if EDITOR:
-                result["_meta"] = {"lembas": {"capabilities": ["editor", "media"]}}
+                result["_meta"] = {"lembas": {"capabilities": ["editor", "media", "files", "steer", "sessions", "ask", "plan"]}}
             out({"jsonrpc": "2.0", "id": msg["id"], "result": result})
         elif method == "_lembas/complete":
             threading.Thread(target=complete, args=(msg,), daemon=True).start()
         elif method == "_lembas/complete/cancel":
             gone.add(msg["params"]["id"])
+        elif method == "_lembas/complete/warm":
+            pass
+        elif method == "_lembas/files/search":
+            q = str((msg.get("params") or {}).get("query") or "").lower()
+            sample = ["sample.py", "other.py"]
+            out({"jsonrpc": "2.0", "id": msg["id"], "result": {"files": [f for f in sample if not q or q in f.lower()]}})
+        elif method == "_lembas/steer":
+            out({"jsonrpc": "2.0", "id": msg["id"], "result": {"queued": True}})
+        elif method == "_lembas/sessions/list":
+            out({"jsonrpc": "2.0", "id": msg["id"], "result": {"sessions": [{"id": "ses_prev", "title": "Previous run", "model": "example/model-a"}]}})
+        elif method == "_lembas/sessions/resume":
+            out({"jsonrpc": "2.0", "id": msg["id"], "result": {
+                "sessionId": "ses_prev",
+                "modes": {"currentModeId": "edit", "availableModes": [{"id": "ask", "name": "Ask"}, {"id": "edit", "name": "Edit"}]},
+                "turns": [{"user": "old prompt", "assistant": "old reply", "tools": []}],
+                "_meta": {"lembas": {"model": "example/model-a", "mode": "edit"}},
+            }})
         elif method == "_lembas/edit":
             p = msg["params"]
             if "REFUSE" in p["instruction"]:

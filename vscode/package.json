@@ -33,10 +33,16 @@
     "commands": [
       { "command": "llembas.open", "title": "Open the Chat", "category": "LLeMbas" },
       { "command": "llembas.newSession", "title": "New Session", "category": "LLeMbas" },
+      { "command": "llembas.resumeSession", "title": "Resume a Previous Session", "category": "LLeMbas" },
       { "command": "llembas.stop", "title": "Stop the Running Turn", "category": "LLeMbas" },
       { "command": "llembas.ask", "title": "Ask About the Selection", "category": "LLeMbas" },
+      { "command": "llembas.explain", "title": "Explain the Selection", "category": "LLeMbas" },
+      { "command": "llembas.fixProblems", "title": "Fix Problems in This File", "category": "LLeMbas" },
+      { "command": "llembas.generate", "title": "Generate Code at Cursor", "category": "LLeMbas" },
       { "command": "llembas.rewrite", "title": "Rewrite the Selection", "category": "LLeMbas" },
       { "command": "llembas.complete", "title": "Suggest a Completion Here", "category": "LLeMbas" },
+      { "command": "llembas.openFile", "title": "Open File from Project Index", "category": "LLeMbas" },
+      { "command": "llembas.addFile", "title": "Add File to Chat", "category": "LLeMbas" },
       { "command": "llembas.acceptChange", "title": "Accept the Proposed Change at the Cursor", "category": "LLeMbas" },
       { "command": "llembas.rejectChange", "title": "Reject the Proposed Change at the Cursor", "category": "LLeMbas" },
       { "command": "llembas.acceptAllChanges", "title": "Accept All Proposed Changes in This File", "category": "LLeMbas" },
@@ -60,12 +66,17 @@
     "menus": {
       "editor/context": [
         { "command": "llembas.ask", "when": "editorHasSelection", "group": "llembas@1" },
-        { "command": "llembas.rewrite", "when": "editorHasSelection && !editorReadonly", "group": "llembas@2" }
+        { "command": "llembas.explain", "when": "editorHasSelection", "group": "llembas@2" },
+        { "command": "llembas.rewrite", "when": "editorHasSelection && !editorReadonly", "group": "llembas@3" },
+        { "command": "llembas.fixProblems", "group": "llembas@4" },
+        { "command": "llembas.generate", "when": "!editorReadonly", "group": "llembas@5" }
       ],
       "view/title": [
         { "command": "llembas.newSession", "when": "view == llembas.chat", "group": "llembas@1" },
-        { "command": "llembas.modelSettings", "when": "view == llembas.chat", "group": "llembas@2" },
-        { "command": "llembas.restart", "when": "view == llembas.chat", "group": "llembas@3" }
+        { "command": "llembas.resumeSession", "when": "view == llembas.chat", "group": "llembas@2" },
+        { "command": "llembas.openFile", "when": "view == llembas.chat", "group": "llembas@3" },
+        { "command": "llembas.modelSettings", "when": "view == llembas.chat", "group": "llembas@4" },
+        { "command": "llembas.restart", "when": "view == llembas.chat", "group": "llembas@5" }
       ],
       "commandPalette": [
         { "command": "llembas.acceptChange", "when": "llembas.hasProposal" },

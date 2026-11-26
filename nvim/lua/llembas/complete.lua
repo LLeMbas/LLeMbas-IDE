@@ -4,7 +4,7 @@
 local M = {}
 local ns = vim.api.nvim_create_namespace("llembas-complete")
 
-local st = { timer = nil, seq = 0, asked = nil, shown = nil, off = nil, said = false }
+local st = { timer = nil, seq = 0, asked = nil, shown = nil, off = nil, said = false, last_warm = nil }
 
 local PREFIX_MAX, SUFFIX_MAX = 16000, 4000
 
@@ -60,6 +60,46 @@ local function usable(buf)
   return vim.bo[buf].buftype == "" and vim.bo[buf].modifiable
 end
 
+--- Collect up to 6 other loaded file buffers' text so the CLI can prefer unsaved open buffers
+--- for session-aware autocomplete context.
+local function open_snippets(exclude_buf)
+  local out = {}
+  for _, b in ipairs(vim.api.nvim_list_bufs()) do
+    if #out >= 6 then break end
+    if b ~= exclude_buf and vim.api.nvim_buf_is_loaded(b) and vim.bo[b].buftype == "" then
+      local name = vim.api.nvim_buf_get_name(b)
+      if name ~= "" then
+        local text = table.concat(vim.api.nvim_buf_get_lines(b, 0, 400, false), "\n")
+        if #text > 0 and #text <= 32768 then
+          out[#out + 1] = { path = name, text = text }
+        end
+      end
+    end
+  end
+  return #out > 0 and out or nil
+end
+
+--- Pre-warm the CLI's session file index & direct imports for `buf` before typing pauses.
+function M.warm(buf)
+  buf = buf or vim.api.nvim_get_current_buf()
+  if not buf or not vim.api.nvim_buf_is_valid(buf) or vim.bo[buf].buftype ~= "" then return end
+  local conn = L()._state.conn
+  if not conn or not L()._state.ready or not L()._state.caps.editor then return end
+  local name = vim.api.nvim_buf_get_name(buf)
+  if name == "" then return end
+  local cwd = vim.fn.getcwd()
+  local key = (L()._state.session or "") .. "|" .. cwd .. "|" .. name
+  if st.last_warm == key then return end
+  st.last_warm = key
+  local text = table.concat(vim.api.nvim_buf_get_lines(buf, 0, 400, false), "\n")
+  conn:notify("_lembas/complete/warm", {
+    cwd = cwd,
+    sessionId = L()._state.session,
+    path = name,
+    text = #text <= 32768 and text or nil,
+  })
+end
+
 --- Ask for a suggestion at the cursor now. `manual`: you pressed the key, so say why nothing came.
 function M.request(manual)
   local buf = vim.api.nvim_get_current_buf()
@@ -96,6 +136,9 @@ function M.request(manual)
     conn:request("_lembas/complete", {
       id = id, prefix = prefix, suffix = suffix, path = name ~= "" and name or nil,
       language = vim.bo[buf].filetype ~= "" and vim.bo[buf].filetype or nil,
+      cwd = vim.fn.getcwd(),
+      sessionId = L()._state.session,
+      open = open_snippets(buf),
       model = L().config.complete.model,
     }, function(err, r)
       if st.asked == id then st.asked = nil end
@@ -147,7 +190,7 @@ function M.auto(on)
 end
 
 --- A model was chosen: ask again.
-function M.reset() st.off, st.said = nil, false end
+function M.reset() st.off, st.said, st.last_warm = nil, false, nil end
 
 local function typed()
   M.clear()
@@ -165,6 +208,7 @@ function M.setup()
   local group = vim.api.nvim_create_augroup("llembas-complete", { clear = true })
   vim.api.nvim_create_autocmd({ "TextChangedI", "CursorMovedI" }, { group = group, callback = typed })
   vim.api.nvim_create_autocmd({ "InsertLeave", "BufLeave" }, { group = group, callback = function() M.clear(); cancel() end })
+  vim.api.nvim_create_autocmd("BufEnter", { group = group, callback = function(ev) M.warm(ev.buf) end })
   local c = L().config.complete
   if c.trigger and c.trigger ~= "" then
     vim.keymap.set("i", c.trigger, function() M.request(true) end, { desc = "LLeMbas: suggest here" })

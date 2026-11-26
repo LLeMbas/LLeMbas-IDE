@@ -9,7 +9,7 @@ test('the hello says what this client is: an editor that shows media and has uns
   await agent.connect();
   const hello = agent.log().find((m) => m.method === 'initialize');
   assert.equal(hello.params.protocolVersion, 1);
-  assert.deepEqual(hello.params.clientCapabilities._meta.lembas, { editor: true, media: true, show: true });
+  assert.deepEqual(hello.params.clientCapabilities._meta.lembas, { protocol: 2, editor: true, media: true, show: true });
   assert.deepEqual(hello.params.clientCapabilities.fs, { readTextFile: true, writeTextFile: false }, 'writing is offered only by a client that can do it');
   assert.ok(agent.ready && agent.has('editor') && agent.has('media') && !agent.has('fs'));
 });

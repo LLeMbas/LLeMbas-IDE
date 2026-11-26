@@ -76,7 +76,12 @@ test('activation registers the view, every command of the manifest, the provider
   assert.equal(view.webview.options.enableCommandUris, false);
   assert.equal(view.webview.options.localResourceRoots.length, 2);
   assert.match(view.webview.html, /Content-Security-Policy" content="default-src 'none'; img-src https:\/\/file\.example; style-src https:\/\/file\.example; script-src 'nonce-[A-Za-z0-9_-]{20,}'/);
-  assert.deepEqual(view.posted[0], { type: 'reset', items: [], state: { busy: false, session: false, mode: null, modes: [], model: null, models: [] }, attached: '' });
+  assert.deepEqual(view.posted[0], {
+    type: 'reset',
+    items: [],
+    state: { busy: false, session: false, mode: null, modes: [], model: null, models: [], progress: '', canSteer: false, commands: [] },
+    attached: '',
+  });
 });
 
 test('a message typed in the view is answered, and the reply reaches the page as a tree, not as markup', async (t) => {
@@ -269,7 +274,7 @@ test('autocomplete: as you type and by hand, as an inline completion at the curs
   assert.equal(got[0].insertText, '<return|example/model-a>');
   assert.deepEqual(got[0].range.start, at);
   assert.deepEqual(sent().find((m) => m.method === '_lembas/complete').params, {
-    id: 'c1', prefix: 'def bake(flour):\n    return ', suffix: '\nprint(1)\n', path: path.join(dir, 'oven.py'), language: 'python',
+    id: 'c1', prefix: 'def bake(flour):\n    return ', suffix: '\nprint(1)\n', path: path.join(dir, 'oven.py'), language: 'python', cwd: dir,
   });
   // The editor's own suggestion list is open: stay out of its way.
   assert.equal(await provider.provideInlineCompletionItems(editor.document, at, { triggerKind: 1, selectedCompletionInfo: {} }, token()), undefined);
@@ -643,4 +648,53 @@ test('a command that is not installed is said in the chat, and autocomplete stay
   view.say({ type: 'send', text: 'hello' });
   await until(() => items().some((i) => i.kind === 'note'));
   assert.match(items().find((i) => i.kind === 'note').text, /^Could not start .*no-such-lembas: the command was not found\.$/);
+});
+
+test('full agentic features: question & plan cards, session resume, @file search, open file:line, and mid-run steer', async (t) => {
+  const { view, sent, run, items, state, idle, dir, s } = host(t);
+  fs.writeFileSync(path.join(dir, 'README.md'), 'line 1\nline 2\nline 3\n');
+
+  // 1. Question card
+  view.say({ type: 'send', text: 'QUESTION' });
+  await until(() => items().some((i) => i.kind === 'question' && i.state === 'open'));
+  const qCard = items().find((i) => i.kind === 'question');
+  view.say({ type: 'answerQuestion', card: qCard.id, answers: [['SQLite']] });
+  await idle();
+  const qReply = items().filter((i) => i.kind === 'agent').pop();
+  assert.ok(JSON.stringify(qReply.ast).includes('SQLite'));
+
+  // 2. Plan approval card
+  view.say({ type: 'send', text: 'PLANCARD' });
+  await until(() => items().some((i) => i.kind === 'plancard' && i.state === 'open'));
+  const pCard = items().find((i) => i.kind === 'plancard');
+  view.say({ type: 'answerPlan', card: pCard.id, outcome: 'approve', value: 'edit' });
+  await idle();
+  const pReply = items().filter((i) => i.kind === 'agent').pop();
+  assert.ok(JSON.stringify(pReply.ast).includes('approve'));
+
+  // 3. @file index search & bringing up a specific file at a line
+  view.say({ type: 'searchFiles', query: 'app', seq: 7 });
+  await until(() => view.posted.some((m) => m.type === 'files' && m.seq === 7));
+  const found = view.posted.find((m) => m.type === 'files' && m.seq === 7);
+  assert.deepEqual(found.files, ['src/app.py']);
+
+  view.say({ type: 'openFile', path: 'README.md', line: 2, soft: true });
+  await until(() => s.executed.some((e) => e[0] === 'showTextDocument'));
+
+  // 4. Session resume replays history
+  s.picks.push((list) => list.find((x) => x.id === 'ses_prev'));
+  await run('llembas.resumeSession');
+  assert.equal(state().mode, 'edit');
+  assert.ok(items().some((i) => i.kind === 'user' && i.text === 'earlier question'));
+  assert.ok(items().some((i) => i.kind === 'agent'));
+
+  // 5. Mid-run steer & live mode switch while busy
+  view.say({ type: 'send', text: 'SLOW' });
+  await until(() => state().busy === true);
+  view.say({ type: 'steer', text: 'focus on tests' });
+  view.say({ type: 'setMode', id: 'ask' });
+  await until(() => sent().some((m) => m.method === '_lembas/steer'));
+  await until(() => state().mode === 'ask');
+  view.say({ type: 'stop' });
+  await idle();
 });

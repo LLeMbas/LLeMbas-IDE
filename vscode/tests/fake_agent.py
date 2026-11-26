@@ -204,6 +204,28 @@ def prompt(msg):
         answer = ask("_lembas/show", params, 30)
         handles.pop(handle, None)
         say(session, "\nshown=" + json.dumps(answer, sort_keys=True))
+    if "QUESTION" in text:
+        answer = ask("_lembas/question", {
+            "sessionId": session,
+            "toolCallId": "q-" + str(msg["id"]),
+            "why": "Need a choice",
+            "questions": [{
+                "header": "Database",
+                "question": "Which backend?",
+                "multiple": False,
+                "options": [{"label": "SQLite", "description": "local file"}, {"label": "Postgres", "description": "server"}],
+            }],
+        })
+        say(session, "\nquestion=" + json.dumps(answer, sort_keys=True))
+    if "PLANCARD" in text:
+        answer = ask("_lembas/plan", {
+            "sessionId": session,
+            "toolCallId": "p-" + str(msg["id"]),
+            "path": ".agent/plans/test.md",
+            "text": "# Upgrade\n- Step 1\n- Step 2",
+            "plan": {"title": "Upgrade", "phases": [{"title": "Phase 1", "tasks": [{"text": "Step 1", "status": "todo"}]}]},
+        })
+        say(session, "\nplan=" + json.dumps(answer, sort_keys=True))
     if "CRASH" in text:
         sys.stderr.write("not signed in: run lembas login\n")
         sys.stderr.flush()
@@ -305,7 +327,7 @@ def main():
                 entry[0].set()
         elif method == "initialize":
             meta = {} if PLAIN else {"lembas": {"protocol": 3, "harness_spec": "3.11.0", "limits": None, "connection": "example",
-                                                "capabilities": ["configure", "show", "editor", "media"]}}
+                                                "capabilities": ["configure", "show", "editor", "media", "files", "commands", "steer", "sessions", "ask", "plan"]}}
             result(msg, {"protocolVersion": 1, "agentCapabilities": {}, "agentInfo": {"name": "stand-in", "version": "0"}, "_meta": meta})
         elif method == "session/new":
             wanted = (msg["params"].get("_meta") or {}).get("model")
@@ -348,6 +370,26 @@ def main():
                 event.set()
         elif method == "_lembas/show/read":
             show_read(msg)
+        elif method == "_lembas/complete/warm":
+            pass
+        elif method == "_lembas/files/search":
+            q = str((msg.get("params") or {}).get("query") or "").lower()
+            sample = ["src/app.py", "src/utils.py", "README.md"]
+            result(msg, {"files": [f for f in sample if not q or q in f.lower()]})
+        elif method == "_lembas/commands":
+            result(msg, {"commands": [{"name": "compact", "description": "Compact context", "source": "builtin"}]})
+        elif method == "_lembas/steer":
+            result(msg, {"queued": True})
+        elif method == "_lembas/sessions/list":
+            result(msg, {"sessions": [{"id": "ses_prev", "title": "Earlier work", "model": "example/model-a", "updated": 1700000000000}]})
+        elif method == "_lembas/sessions/resume":
+            sid = (msg.get("params") or {}).get("sessionId") or "ses_prev"
+            result(msg, {
+                "sessionId": sid,
+                "modes": {"currentModeId": "edit", "availableModes": [{"id": "ask", "name": "Ask"}, {"id": "edit", "name": "Edit"}]},
+                "turns": [{"user": "earlier question", "assistant": "earlier answer", "tools": []}],
+                "_meta": {"lembas": {"model": session_model[0], "mode": "edit"}},
+            })
         elif "id" in msg:
             refuse(msg, -32601, "Method not found")
 

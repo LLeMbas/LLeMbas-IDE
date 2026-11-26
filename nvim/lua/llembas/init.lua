@@ -24,7 +24,7 @@ M.config = {
 }
 
 local S = { conn = nil, session = nil, starting = nil, connecting = nil, ready = false, caps = {}, busy = false,
-            modes = {}, mode = nil, model = nil, attached = nil, attached_label = nil, last_buf = nil, said = nil }
+            modes = {}, mode = nil, model = nil, progress = nil, attached = nil, attached_label = nil, last_buf = nil, said = nil }
 
 local function note(text) chat.newline(); chat.append("> " .. text .. "\n") end
 
@@ -33,7 +33,7 @@ local function status()
   if S.attached_label then parts[#parts + 1] = "with " .. S.attached_label end
   if S.mode then parts[#parts + 1] = "mode " .. S.mode end
   if S.model then parts[#parts + 1] = S.model end
-  if S.busy then parts[#parts + 1] = "working (Ctrl-C stops)" end
+  if S.busy then parts[#parts + 1] = (S.progress and S.progress ~= "" and (S.progress .. " (Ctrl-C stops)") or "working (Ctrl-C stops)") end
   chat.status(" " .. table.concat(parts, " | "))
 end
 
@@ -107,6 +107,102 @@ local function on_permission(p, reply)
   end)
 end
 
+local function on_question(p, reply)
+  local qs = p.questions or {}
+  local id = "q:" .. tostring(p.toolCallId or "")
+  chat.line(id, "- ? " .. (p.why or (qs[1] and qs[1].question) or "question") .. " (waits for your answer)")
+  pcall(vim.cmd, "stopinsert")
+  local answers = {}
+  local function ask_idx(i)
+    if i > #qs then
+      chat.line(id, "- answered question")
+      return reply({ outcome = "answered", answers = answers })
+    end
+    local q = qs[i]
+    local opts = q.options or {}
+    if #opts > 0 then
+      local choices = {}
+      for _, o in ipairs(opts) do choices[#choices + 1] = o end
+      choices[#choices + 1] = { label = "__custom__", _custom = true }
+      vim.ui.select(choices, {
+        prompt = (q.header and (q.header .. ": ") or "") .. (q.question or "Choose"),
+        format_item = function(o)
+          if o._custom then return "Type a custom answer…" end
+          return o.description and o.description ~= "" and (o.label .. " — " .. o.description) or o.label
+        end,
+      }, function(choice)
+        if not choice then
+          chat.line(id, "- ✗ question dismissed")
+          return reply({ outcome = "dismissed" })
+        end
+        if choice._custom then
+          vim.ui.input({ prompt = (q.question or "Answer") .. ": " }, function(text)
+            if not text or not text:match("%S") then
+              chat.line(id, "- ✗ question dismissed")
+              return reply({ outcome = "dismissed" })
+            end
+            answers[i] = { text }
+            ask_idx(i + 1)
+          end)
+        else
+          answers[i] = { choice.label }
+          ask_idx(i + 1)
+        end
+      end)
+    else
+      vim.ui.input({ prompt = (q.question or "Answer") .. ": " }, function(text)
+        if not text then
+          chat.line(id, "- ✗ question dismissed")
+          return reply({ outcome = "dismissed" })
+        end
+        answers[i] = { text }
+        ask_idx(i + 1)
+      end)
+    end
+  end
+  ask_idx(1)
+end
+
+local function on_plan(p, reply)
+  local title = (p.plan and p.plan.title) or "Plan ready"
+  local id = "plan:" .. tostring(p.toolCallId or "")
+  chat.section("Plan: " .. title)
+  if type(p.text) == "string" and p.text ~= "" then chat.append(p.text .. "\n") end
+  chat.line(id, "- ? " .. title .. " (waits for approval)")
+  pcall(vim.cmd, "stopinsert")
+  local actions = {
+    { id = "dismiss", label = "Dismiss" },
+    { id = "approve_edit", label = "Approve (edit mode)" },
+    { id = "approve_manual", label = "Approve (manual mode)" },
+    { id = "revise", label = "Revise with feedback" },
+  }
+  vim.ui.select(actions, {
+    prompt = "LLeMbas plan: " .. title,
+    format_item = function(a) return a.label end,
+  }, function(choice)
+    if not choice or choice.id == "dismiss" then
+      chat.line(id, "- ✗ plan dismissed")
+      return reply({ outcome = "dismiss" })
+    end
+    if choice.id == "approve_edit" then
+      chat.line(id, "- ✓ plan approved (edit mode)")
+      return reply({ outcome = "approve", mode = "edit" })
+    end
+    if choice.id == "approve_manual" then
+      chat.line(id, "- ✓ plan approved (manual mode)")
+      return reply({ outcome = "approve", mode = "manual" })
+    end
+    vim.ui.input({ prompt = "Plan revision feedback: " }, function(fb)
+      if not fb or not fb:match("%S") then
+        chat.line(id, "- ✗ plan dismissed")
+        return reply({ outcome = "dismiss" })
+      end
+      chat.line(id, "- ↻ plan revision requested")
+      reply({ outcome = "revise", feedback = fb })
+    end)
+  end)
+end
+
 local function stopped(code, stderr)
   local was = S.session ~= nil or S.starting ~= nil
   local waiting = S.starting
@@ -137,10 +233,22 @@ local function connect(cb, quiet)
   local conn, err = rpc.start(M.config.cmd, {
     notify = function(method, params)
       if method == "session/update" and params.sessionId == S.session then on_update(params.update or {})
-      elseif method == "_lembas/edit/delta" then require("llembas.diff").delta(params) end
+      elseif method == "_lembas/edit/delta" then require("llembas.diff").delta(params)
+      elseif method == "_lembas/event" and params.sessionId == S.session and params.event then
+        local ev = params.event
+        if ev.type == "model" and type(ev.ref) == "string" then S.model = ev.ref; status()
+        elseif ev.type == "mode" and type(ev.mode) == "string" then S.mode = ev.mode; status()
+        elseif ev.type == "phase" then
+          local pr = ev.progress
+          S.progress = (pr and type(pr.phase) == "string") and (pr.phase:gsub("_", " ") .. (pr.detail and (": " .. pr.detail) or "")) or nil
+          status()
+        end
+      end
     end,
     request = function(method, params, reply)
       if method == "session/request_permission" then return on_permission(params, reply) end
+      if method == "_lembas/question" then return on_question(params, reply) end
+      if method == "_lembas/plan" then return on_plan(params, reply) end
       if method == "fs/read_text_file" then return require("llembas.context").read_for_agent(params, reply) end
       if method == "_lembas/show" then return M._show(params, reply) end
       if method == "fs/write_text_file" then return require("llembas.context").write_for_agent(params, reply) end
@@ -159,7 +267,7 @@ local function connect(cb, quiet)
   conn:request("initialize", {
     protocolVersion = 1,
     clientCapabilities = { fs = { readTextFile = true, writeTextFile = true },
-      _meta = { lembas = { editor = true, show = true, media = true } } },
+      _meta = { lembas = { protocol = 2, editor = true, show = true, media = true } } },
     clientInfo = { name = "llembas.nvim", version = M.version },
   }, function(e1, r)
     if S.conn ~= conn then return done(false) end
@@ -172,6 +280,7 @@ local function connect(cb, quiet)
     S.ready = true
     S.caps = {}
     for _, c in ipairs((((r or {})._meta or {}).lembas or {}).capabilities or {}) do S.caps[c] = true end
+    require("llembas.complete").warm(S.last_buf)
     done(true)
   end)
 end
@@ -240,6 +349,14 @@ end
 --- that takes the editor's context as data (`editor`) gets it so; an older one is told in a sentence.
 local function send_typed(text)
   if S.busy then
+    if S.conn and S.session and S.caps.steer then
+      chat.section("You (while working)")
+      chat.append(text .. "\n")
+      S.conn:request("_lembas/steer", { sessionId = S.session, text = text }, function(err)
+        if err then note("Steer failed: " .. tostring(err.message)) end
+      end)
+      return true
+    end
     vim.notify("LLeMbas is still working on the last message (:LLeMbasStop stops it)", vim.log.levels.WARN)
     return false
   end
@@ -367,6 +484,108 @@ function M.mode(id)
   end)
 end
 
+--- Search the project file index (`_lembas/files/search`) and either open a file or insert `@path` into chat.
+function M.files(query, open_directly)
+  ensure(function(ok)
+    if not ok then return end
+    local function pick_from(list)
+      if not list or #list == 0 then return vim.notify("LLeMbas: no matching files found", vim.log.levels.INFO) end
+      vim.ui.select(list, { prompt = open_directly and "LLeMbas open file" or "LLeMbas attach file to chat" }, function(file)
+        if not file then return end
+        if open_directly then
+          local full = file:match("^/") and file or (vim.fn.getcwd() .. "/" .. file)
+          local target
+          for _, w in ipairs(vim.api.nvim_tabpage_list_wins(0)) do
+            if vim.bo[vim.api.nvim_win_get_buf(w)].buftype == "" then target = w break end
+          end
+          if target then vim.api.nvim_set_current_win(target) end
+          pcall(vim.cmd, "edit " .. vim.fn.fnameescape(full))
+        else
+          M.open(true)
+          chat.insert_prompt("@" .. file .. " ")
+        end
+      end)
+    end
+    if S.caps.files then
+      S.conn:request("_lembas/files/search", { sessionId = S.session, query = query or "", limit = 50 }, function(err, r)
+        if err then return vim.notify("LLeMbas: " .. tostring(err.message), vim.log.levels.ERROR) end
+        pick_from(r and r.files or {})
+      end)
+    else
+      local found = vim.fn.glob("**/*", false, true)
+      local out = {}
+      local q = (query or ""):lower()
+      for _, f in ipairs(found) do
+        if vim.fn.isdirectory(f) == 0 and (q == "" or f:lower():find(q, 1, true)) then
+          out[#out + 1] = f
+          if #out >= 50 then break end
+        end
+      end
+      pick_from(out)
+    end
+  end)
+end
+
+--- List previous sessions in this project and resume one with its history (`_lembas/sessions/list` & `resume`).
+function M.sessions()
+  if S.busy then return vim.notify("LLeMbas is working; stop it first (:LLeMbasStop)", vim.log.levels.WARN) end
+  connect(function(ok)
+    if not ok then return end
+    S.conn:request("_lembas/sessions/list", { cwd = vim.fn.getcwd(), limit = 40 }, function(err, r)
+      if err then return vim.notify("LLeMbas: " .. tostring(err.message), vim.log.levels.ERROR) end
+      local list = (r and r.sessions) or {}
+      if #list == 0 then return vim.notify("LLeMbas: no previous sessions in this directory", vim.log.levels.INFO) end
+      vim.ui.select(list, {
+        prompt = "LLeMbas resume session",
+        format_item = function(s) return (s.title or s.id) .. (s.model and ("  (" .. s.model .. ")") or "") end,
+      }, function(chosen)
+        if not chosen then return end
+        S.conn:request("_lembas/sessions/resume", { sessionId = chosen.id }, function(e2, res)
+          if e2 then return vim.notify("LLeMbas: " .. tostring(e2.message), vim.log.levels.ERROR) end
+          S.session = res.sessionId
+          S.modes = (res.modes and res.modes.availableModes) or S.modes
+          local lm = (res._meta or {}).lembas or {}
+          S.mode = (res.modes and res.modes.currentModeId) or lm.mode or S.mode
+          S.model = lm.model or S.model
+          tools = {}
+          chat.clear()
+          M.open(false)
+          for _, turn in ipairs(res.turns or {}) do
+            if type(turn.user) == "string" and turn.user ~= "" then
+              chat.section("You")
+              chat.append(turn.user .. "\n")
+            end
+            for _, t in ipairs(turn.tools or {}) do
+              chat.line("hist:" .. tostring(t.id or ""), ("- %s %s"):format(t.isError and "✗" or "✓", t.title or t.name or "tool"))
+            end
+            if type(turn.assistant) == "string" and turn.assistant ~= "" then
+              chat.section("LLeMbas")
+              chat.append(turn.assistant .. "\n")
+            end
+          end
+          S.said = nil
+          status()
+        end)
+      end)
+    end)
+  end)
+end
+
+--- Explain the selected lines concisely in the chat panel.
+function M.explain(first, last)
+  M.ask(first, last, "Explain the selected code concisely, including any subtle behavior or edge cases.")
+end
+
+--- Send the current buffer's diagnostics to the agent to fix.
+function M.fix()
+  local buf = editing_buf()
+  if not buf then return vim.notify("LLeMbas: open a file first", vim.log.levels.WARN) end
+  local diags = vim.diagnostic.get(buf)
+  if #diags == 0 then return vim.notify("LLeMbas: no diagnostics reported in this buffer", vim.log.levels.INFO) end
+  M.open(false)
+  send_typed("Fix the reported diagnostics in this file.")
+end
+
 function M.model(name)
   if not name or name == "" then return vim.notify("LLeMbas: model " .. (S.model or "not known yet"), vim.log.levels.INFO) end
   ensure(function(ok)
@@ -384,17 +603,32 @@ end
 --- the system's own viewer on request. Nothing here is rendered or run.
 function M._show(p, reply)
   local path = p.uri and vim.uri_to_fname(p.uri) or p.path
+  local target
+  for _, w in ipairs(vim.api.nvim_tabpage_list_wins(0)) do
+    if vim.bo[vim.api.nvim_win_get_buf(w)].buftype == "" then target = w break end
+  end
+  if type(path) == "string" and path ~= "" then
+    if not path:match("^/") then path = vim.fn.getcwd() .. "/" .. path end
+  end
+  if (not path or path == "" or vim.fn.filereadable(path) == 0) and type(p.text) == "string" then
+    local b = vim.api.nvim_create_buf(false, true)
+    vim.bo[b].buftype = "nofile"
+    vim.bo[b].bufhidden = "wipe"
+    vim.bo[b].swapfile = false
+    vim.bo[b].modeline = false
+    vim.api.nvim_buf_set_lines(b, 0, -1, false, vim.split(p.text, "\n", { plain = true }))
+    vim.bo[b].modifiable = false
+    if target then vim.api.nvim_win_set_buf(target, b) end
+    chat.line("show:" .. tostring(p.toolCallId), "- shown: " .. tostring(p.path or "text"))
+    S.said = "tool"
+    return reply({ shown = true })
+  end
   if type(path) ~= "string" or path == "" then return reply({ shown = false, reason = "no path" }) end
-  if not path:match("^/") then path = vim.fn.getcwd() .. "/" .. path end
   if vim.fn.filereadable(path) == 0 then return reply({ shown = false, reason = "the editor cannot read that file" }) end
   local texty = ({ markdown = true, code = true, text = true, html = true, table = true, svg = true, notebook = true })[p.kind or ""]
   S.shown = path
   local rel = vim.fn.fnamemodify(path, ":.")
   if texty then
-    local target
-    for _, w in ipairs(vim.api.nvim_tabpage_list_wins(0)) do
-      if vim.bo[vim.api.nvim_win_get_buf(w)].buftype == "" then target = w break end
-    end
     if target then
       vim.api.nvim_win_call(target, function()
         pcall(vim.cmd, "keepalt edit " .. vim.fn.fnameescape(path))

@@ -408,6 +408,24 @@ check("models: the quick switch is this editor's only", L.config.complete.model 
 vim.cmd("LLeMbasMainModel example/model-b")
 check("models: the main model is saved as its own entry",
   wait(function() local k = calls("_lembas/editor/settings"); return k[#k].set and k[#k].set.main_model == "example/model-b" end))
+-- Agentic IDE features: question card, plan card, file index attach & session resume.
+vim.ui.select = function(items, opts, cb)
+  if opts.prompt:find("Which DB", 1, true) then return cb(items[1]) end
+  if opts.prompt:find("LLeMbas plan", 1, true) then return cb(items[2]) end
+  return cb(items[1])
+end
+type_and_send("QUESTION")
+check("question: interactive answer reaches agent", idle() and chat.text():find("SQLite", 1, true) ~= nil, chat.text())
+type_and_send("PLANCARD")
+check("plan: interactive approval reaches agent", idle() and chat.text():find("approve", 1, true) ~= nil, chat.text())
+vim.cmd("LLeMbasFiles other")
+check("files: attaches @path into prompt",
+  wait(function() return table.concat(vim.api.nvim_buf_get_lines(chat.ibuf, 0, -1, false), ""):find("@other.py", 1, true) ~= nil end))
+vim.api.nvim_buf_set_lines(chat.ibuf, 0, -1, false, {})
+vim.cmd("LLeMbasSessions")
+check("sessions: resumes previous session and replays history",
+  wait(function() return L._state.session == "ses_prev" and chat.text():find("old reply", 1, true) ~= nil end), chat.text())
+
 vim.notify = notify
 
 -- 9. A command that does not exist is said, not thrown.

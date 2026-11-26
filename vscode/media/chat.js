@@ -5,6 +5,7 @@
   'use strict';
 
   var MARKS = { pending: '…', in_progress: '…', completed: '✓', failed: '✗' };
+  var PLAN_MARKS = { pending: '☐', in_progress: '▸', completed: '✓' };
   var MAX_DEPTH = 8;
 
   function el(doc, tag, cls, text) {
@@ -129,6 +130,17 @@
     } else if (item.kind === 'plan') {
       root.appendChild(el(doc, 'span', 'mark', item.done >= item.all ? '✓' : '…'));
       root.appendChild(el(doc, 'span', 'title', 'Plan: ' + Number(item.done) + ' of ' + Number(item.all) + ' tasks done'));
+      var entries = Array.isArray(item.entries) ? item.entries : [];
+      if (entries.length) {
+        var plist = el(doc, 'div', 'plan-entries');
+        entries.slice(0, 20).forEach(function (ent) {
+          var row = el(doc, 'div', 'plan-entry ' + String(ent.status || 'pending').replace(/[^a-z_]/g, ''));
+          row.appendChild(el(doc, 'span', 'pmark', PLAN_MARKS[ent.status] || '☐'));
+          row.appendChild(el(doc, 'span', 'ptext', String(ent.content || '')));
+          plist.appendChild(row);
+        });
+        root.appendChild(plist);
+      }
     } else if (item.kind === 'card') {
       var open = item.state === 'open';
       if (!open) root.className += ' closed';
@@ -150,6 +162,98 @@
           }));
         }
         root.appendChild(row);
+      } else {
+        root.appendChild(el(doc, 'div', 'reason', item.answer));
+      }
+    } else if (item.kind === 'question') {
+      var qOpen = item.state === 'open';
+      root.className += ' card' + (qOpen ? '' : ' closed');
+      root.appendChild(el(doc, 'div', 'who', qOpen ? 'LLeMbas asks a question' : 'Question'));
+      if (item.why) root.appendChild(el(doc, 'div', 'reason', item.why));
+      var qs = Array.isArray(item.questions) ? item.questions : [];
+      if (qOpen) {
+        var chosen = qs.map(function () { return []; });
+        var inputs = [];
+        qs.forEach(function (q, qi) {
+          var blk = el(doc, 'div', 'q-block');
+          if (q.header) blk.appendChild(el(doc, 'div', 'q-header', q.header));
+          blk.appendChild(el(doc, 'div', 'title', q.question));
+          var opts = Array.isArray(q.options) ? q.options : [];
+          if (opts.length) {
+            var optWrap = el(doc, 'div', 'q-options');
+            var btns = [];
+            opts.forEach(function (o) {
+              var b = button(doc, o.label + (o.description ? ' — ' + o.description : ''), 'second q-opt', function () {
+                if (q.multiple) {
+                  var idx = chosen[qi].indexOf(o.label);
+                  if (idx >= 0) {
+                    chosen[qi].splice(idx, 1);
+                    b.className = 'second q-opt';
+                  } else {
+                    chosen[qi].push(o.label);
+                    b.className = 'q-opt selected';
+                  }
+                } else {
+                  chosen[qi] = [o.label];
+                  btns.forEach(function (other) { other.className = 'second q-opt'; });
+                  b.className = 'q-opt selected';
+                }
+              });
+              btns.push(b);
+              optWrap.appendChild(b);
+            });
+            blk.appendChild(optWrap);
+          }
+          var inp = el(doc, 'input', 'q-input');
+          inp.setAttribute('type', 'text');
+          inp.setAttribute('placeholder', opts.length ? 'Or write your own answer…' : 'Your answer…');
+          inputs.push(inp);
+          blk.appendChild(inp);
+          root.appendChild(blk);
+        });
+        var qRow = el(doc, 'div', 'buttons');
+        qRow.appendChild(button(doc, 'Submit', '', function () {
+          var answers = qs.map(function (q, qi) {
+            var typed = (inputs[qi] && typeof inputs[qi].value === 'string' ? inputs[qi].value.trim() : '');
+            var list = chosen[qi].slice();
+            if (typed) list.push(typed);
+            if (!list.length && q.options && q.options[0]) list.push(q.options[0].label);
+            return list;
+          });
+          post({ type: 'answerQuestion', card: item.id, answers: answers });
+        }));
+        qRow.appendChild(button(doc, 'Dismiss', 'second', function () {
+          post({ type: 'dismissQuestion', card: item.id });
+        }));
+        root.appendChild(qRow);
+      } else {
+        root.appendChild(el(doc, 'div', 'reason', item.answer));
+      }
+    } else if (item.kind === 'plancard') {
+      var pOpen = item.state === 'open';
+      root.className += ' card' + (pOpen ? '' : ' closed');
+      root.appendChild(el(doc, 'div', 'who', pOpen ? 'Plan ready for approval' : 'Plan'));
+      root.appendChild(el(doc, 'div', 'title', item.title || 'Plan'));
+      if (pOpen && item.text) root.appendChild(el(doc, 'pre', '', item.text));
+      if (pOpen) {
+        var fb = el(doc, 'input', 'q-input');
+        fb.setAttribute('type', 'text');
+        fb.setAttribute('placeholder', 'Optional feedback to revise the plan…');
+        root.appendChild(fb);
+        var pRow = el(doc, 'div', 'buttons');
+        pRow.appendChild(button(doc, 'Approve (Edit)', '', function () {
+          post({ type: 'answerPlan', card: item.id, outcome: 'approve', value: 'edit' });
+        }));
+        pRow.appendChild(button(doc, 'Approve (Manual)', 'second', function () {
+          post({ type: 'answerPlan', card: item.id, outcome: 'approve', value: 'manual' });
+        }));
+        pRow.appendChild(button(doc, 'Revise', 'second', function () {
+          post({ type: 'answerPlan', card: item.id, outcome: 'revise', value: fb.value || '' });
+        }));
+        pRow.appendChild(button(doc, 'Dismiss', 'second', function () {
+          post({ type: 'answerPlan', card: item.id, outcome: 'dismiss', value: '' });
+        }));
+        root.appendChild(pRow);
       } else {
         root.appendChild(el(doc, 'div', 'reason', item.answer));
       }
@@ -185,13 +289,17 @@
   var log = doc.getElementById('log');
   var prompt = doc.getElementById('prompt');
   var send = doc.getElementById('send');
+  var stopBtn = doc.getElementById('stop');
   var mode = doc.getElementById('mode');
   var model = doc.getElementById('model');
   var attached = doc.getElementById('attached');
   var attachedLabel = doc.getElementById('attached-label');
   var working = doc.getElementById('working');
-  var state = { busy: false, modes: [], models: [], mode: null, model: null };
+  var popup = doc.getElementById('popup');
+  var state = { busy: false, modes: [], models: [], mode: null, model: null, commands: [], progress: '', canSteer: false };
   var nodes = {};
+  var popupState = { kind: '', tokenStart: 0, tokenEnd: 0, items: [], index: 0 };
+  var fileSearchSeq = 0;
 
   function post(msg) {
     vscode.postMessage(msg);
@@ -243,34 +351,152 @@
     state = s;
     fill(mode, s.modes || [], s.mode, 'Mode');
     fill(model, s.models || [], s.model, 'Model');
-    send.textContent = s.busy ? 'Stop' : 'Send';
+    if (stopBtn) stopBtn.hidden = !s.busy;
+    send.textContent = s.busy ? (s.canSteer ? 'Steer' : 'Stop') : 'Send';
     working.hidden = !s.busy;
-    mode.disabled = mode.disabled || !!s.busy;
+    working.textContent = s.progress || 'Working…';
+    // Mode can be switched live mid-run (Edit <-> Auto, etc.).
+    mode.disabled = (s.modes || []).length === 0;
     model.disabled = model.disabled || !!s.busy;
   }
 
+  // ---- @file and /command autocomplete popup -------------------------------------------
+
+  function hidePopup() {
+    popupState = { kind: '', tokenStart: 0, tokenEnd: 0, items: [], index: 0 };
+    if (popup) {
+      popup.hidden = true;
+      while (popup.firstChild) popup.removeChild(popup.firstChild);
+    }
+  }
+
+  function renderPopup() {
+    if (!popup || !popupState.items.length) return hidePopup();
+    while (popup.firstChild) popup.removeChild(popup.firstChild);
+    popupState.items.forEach(function (it, idx) {
+      var row = el(doc, 'div', 'popup-row' + (idx === popupState.index ? ' active' : ''));
+      row.setAttribute('role', 'option');
+      row.appendChild(el(doc, 'span', 'popup-label', it.label));
+      if (it.detail) row.appendChild(el(doc, 'span', 'popup-detail', it.detail));
+      row.addEventListener('mousedown', function (ev) {
+        ev.preventDefault();
+        applyPopup(idx);
+      });
+      popup.appendChild(row);
+    });
+    popup.hidden = false;
+  }
+
+  function applyPopup(idx) {
+    var it = popupState.items[idx];
+    if (!it) return hidePopup();
+    var before = prompt.value.slice(0, popupState.tokenStart);
+    var after = prompt.value.slice(popupState.tokenEnd);
+    var inserted = it.insert + (after.startsWith(' ') ? '' : ' ');
+    prompt.value = before + inserted + after;
+    var pos = (before + inserted).length;
+    prompt.setSelectionRange(pos, pos);
+    vscode.setState({ draft: prompt.value });
+    hidePopup();
+    prompt.focus();
+  }
+
+  function checkPopup() {
+    var pos = prompt.selectionStart || 0;
+    var before = prompt.value.slice(0, pos);
+    var slash = /^\/([A-Za-z0-9_:-]*)$/.exec(before);
+    if (slash) {
+      var q = slash[1].toLowerCase();
+      var matches = (state.commands || [])
+        .filter(function (c) { return !q || c.name.toLowerCase().indexOf(q) >= 0; })
+        .slice(0, 12)
+        .map(function (c) { return { label: '/' + c.name, detail: c.description || '', insert: '/' + c.name }; });
+      popupState = { kind: 'command', tokenStart: 0, tokenEnd: pos, items: matches, index: 0 };
+      renderPopup();
+      return;
+    }
+    var at = /(?:^|\s)@([^\s@]*)$/.exec(before);
+    if (at) {
+      var start = pos - at[1].length - 1;
+      var seq = ++fileSearchSeq;
+      popupState = { kind: 'file', tokenStart: start, tokenEnd: pos, items: popupState.kind === 'file' ? popupState.items : [], index: 0 };
+      post({ type: 'searchFiles', query: at[1], seq: seq });
+      return;
+    }
+    hidePopup();
+  }
+
   function submit() {
-    if (state.busy) return post({ type: 'stop' });
     var text = prompt.value;
+    if (state.busy) {
+      if (state.canSteer && text.trim()) {
+        post({ type: 'steer', text: text });
+        prompt.value = '';
+        vscode.setState({ draft: '' });
+        hidePopup();
+        return;
+      }
+      if (!state.canSteer) post({ type: 'stop' });
+      return;
+    }
     if (!text.trim()) return;
     post({ type: 'send', text: text });
     prompt.value = '';
     vscode.setState({ draft: '' });
+    hidePopup();
   }
 
   send.addEventListener('click', submit);
+  if (stopBtn) {
+    stopBtn.addEventListener('click', function () {
+      post({ type: 'stop' });
+    });
+  }
   prompt.addEventListener('keydown', function (ev) {
+    if (popup && !popup.hidden && popupState.items.length) {
+      if (ev.key === 'ArrowDown') {
+        ev.preventDefault();
+        popupState.index = (popupState.index + 1) % popupState.items.length;
+        return renderPopup();
+      }
+      if (ev.key === 'ArrowUp') {
+        ev.preventDefault();
+        popupState.index = (popupState.index - 1 + popupState.items.length) % popupState.items.length;
+        return renderPopup();
+      }
+      if (ev.key === 'Tab' || (ev.key === 'Enter' && !ev.shiftKey && !ev.isComposing)) {
+        ev.preventDefault();
+        return applyPopup(popupState.index);
+      }
+      if (ev.key === 'Escape') {
+        ev.preventDefault();
+        return hidePopup();
+      }
+    }
     if (ev.key === 'Enter' && !ev.shiftKey && !ev.isComposing) {
       ev.preventDefault();
-      if (!state.busy) submit();
+      if (!state.busy || (state.canSteer && prompt.value.trim())) submit();
     }
   });
   prompt.addEventListener('input', function () {
     vscode.setState({ draft: prompt.value });
+    checkPopup();
   });
   doc.getElementById('new').addEventListener('click', function () {
     post({ type: 'new' });
   });
+  var sessionsBtn = doc.getElementById('sessions');
+  if (sessionsBtn) {
+    sessionsBtn.addEventListener('click', function () {
+      post({ type: 'sessions' });
+    });
+  }
+  var addFileBtn = doc.getElementById('add-file');
+  if (addFileBtn) {
+    addFileBtn.addEventListener('click', function () {
+      post({ type: 'addFile' });
+    });
+  }
   doc.getElementById('detach').addEventListener('click', function () {
     post({ type: 'detach' });
   });
@@ -285,7 +511,17 @@
     var t = target;
     while (t && t !== log) {
       if (t.getAttribute && t.getAttribute('data-href')) return post({ type: 'openLink', href: t.getAttribute('data-href') });
-      if (t.getAttribute && t.getAttribute('data-file')) return post({ type: 'openFile', path: t.getAttribute('data-file') });
+      if (t.getAttribute && t.getAttribute('data-file')) {
+        var lineAttr = t.getAttribute('data-line');
+        return post({ type: 'openFile', path: t.getAttribute('data-file'), line: lineAttr ? Number(lineAttr) : undefined });
+      }
+      if (t.tagName === 'CODE' && (!t.parentNode || t.parentNode.tagName !== 'PRE')) {
+        var raw = (t.textContent || '').trim();
+        var fm = /^([A-Za-z0-9_.\-\/]+\.[A-Za-z0-9]{1,10})(?::(\d+)(?:-\d+)?)?$/.exec(raw);
+        if (fm) {
+          return post({ type: 'openFile', path: fm[1], line: fm[2] ? Number(fm[2]) : undefined, soft: true });
+        }
+      }
       t = t.parentNode;
     }
   }
@@ -307,6 +543,18 @@
     else if (m.type === 'state') showState(m.state);
     else if (m.type === 'attached') showAttached(m.label);
     else if (m.type === 'focus') prompt.focus();
+    else if (m.type === 'insertText' && typeof m.text === 'string') {
+      var cur = prompt.value;
+      prompt.value = cur && !/\s$/.test(cur) ? cur + ' ' + m.text : cur + m.text;
+      vscode.setState({ draft: prompt.value });
+      prompt.focus();
+    } else if (m.type === 'files' && m.seq === fileSearchSeq && popupState.kind === 'file') {
+      popupState.items = (Array.isArray(m.files) ? m.files : []).slice(0, 14).map(function (f) {
+        return { label: f, detail: '', insert: '@' + f };
+      });
+      popupState.index = 0;
+      renderPopup();
+    }
   });
 
   function showAttached(label) {

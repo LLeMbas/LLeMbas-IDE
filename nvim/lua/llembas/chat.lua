@@ -41,6 +41,27 @@ local function buffers()
     vim.keymap.set("n", "<C-c>", function() if M.on_stop then M.on_stop() end end, { buffer = M.ibuf, desc = "LLeMbas: stop the turn" })
     vim.keymap.set("n", "q", function() M.close() end, { buffer = M.ibuf, desc = "LLeMbas: close the panel" })
     vim.keymap.set("n", "q", function() M.close() end, { buffer = M.tbuf, desc = "LLeMbas: close the panel" })
+    local function open_at_cursor()
+      local token = vim.fn.expand("<cWORD>")
+      if not token or token == "" then return end
+      token = token:gsub("^[`\"'(%[<]+", ""):gsub("[`\"')%]>.,;:]+$", "")
+      local path, line = token:match("^([%w%._%-%/]+%.[%w]+):(%d+)")
+      if not path then path = token:match("^([%w%._%-%/]+%.[%w]+)$") end
+      if not path then return end
+      local full = path:match("^/") and path or (vim.fn.getcwd() .. "/" .. path)
+      if vim.fn.filereadable(full) == 0 then return end
+      local target
+      for _, w in ipairs(vim.api.nvim_tabpage_list_wins(0)) do
+        if vim.bo[vim.api.nvim_win_get_buf(w)].buftype == "" then target = w break end
+      end
+      if target then
+        vim.api.nvim_set_current_win(target)
+        pcall(vim.cmd, "edit " .. vim.fn.fnameescape(full))
+        if tonumber(line) then pcall(vim.api.nvim_win_set_cursor, 0, { tonumber(line), 0 }) end
+      end
+    end
+    vim.keymap.set("n", "<CR>", open_at_cursor, { buffer = M.tbuf, desc = "LLeMbas: open file:line under cursor" })
+    vim.keymap.set("n", "gf", open_at_cursor, { buffer = M.tbuf, desc = "LLeMbas: open file:line under cursor" })
   end
 end
 
@@ -165,6 +186,14 @@ function M.clear()
   vim.api.nvim_buf_clear_namespace(M.tbuf, ns, 0, -1)
   vim.api.nvim_buf_set_lines(M.tbuf, 0, -1, false, {})
   vim.bo[M.tbuf].modifiable = false
+end
+
+function M.insert_prompt(text)
+  buffers()
+  local lines = vim.api.nvim_buf_get_lines(M.ibuf, 0, -1, false)
+  local last = lines[#lines] or ""
+  lines[#lines] = (last ~= "" and not last:match("%s$") and (last .. " " .. text)) or (last .. text)
+  vim.api.nvim_buf_set_lines(M.ibuf, 0, -1, false, lines)
 end
 
 function M.text()

@@ -43,9 +43,14 @@ class Chat extends EventEmitter {
     this.modes = [];
     this.mode = null;
     this.model = null;
+    this.progress = '';
+    this.commands = [];
     this.said = null;
+    this.planItem = null;
     this.tools = new Map();
     this.cards = new Map();
+    this.questions = new Map();
+    this.planCards = new Map();
   }
 
   options() {
@@ -79,6 +84,9 @@ class Chat extends EventEmitter {
       modes: this.modes.map((m) => ({ id: String(m.id), name: String(m.name || m.id) })),
       model: this.model,
       models: this.models.filter((m) => !Array.isArray(m.for) || m.for.includes('main')).map((m) => ({ id: String(m.id), name: String(m.name || m.id) })),
+      progress: this.progress,
+      canSteer: !!(this.session && this.has('steer')),
+      commands: this.commands,
     };
   }
 
@@ -128,6 +136,8 @@ class Chat extends EventEmitter {
     const had = this.session !== null || this.sessionStarting !== null || this.busy;
     this.agent = null;
     for (const card of [...this.cards.values()]) this._settle(card, 'The agent stopped before this was answered.');
+    for (const q of [...this.questions.values()]) this._settleQuestion(q, 'The agent stopped before this was answered.');
+    for (const pl of [...this.planCards.values()]) this._settlePlan(pl, 'The agent stopped before this was answered.');
     this._clearSession();
     if (e && e.started && had) this.note(`The agent stopped (${e.signal || 'exit ' + e.code})${e.last ? ': ' + e.last : '.'}`);
     else if (!e && had) this.note('The agent was stopped. The next message starts a new session.');
@@ -184,6 +194,7 @@ class Chat extends EventEmitter {
       this.model = lembas.model || null;
       this.emit('state');
       if (agent.has('editor')) this.loadModels().catch(() => {});
+      if (agent.has('commands')) this.loadCommands().catch(() => {});
       return true;
     })();
     this.sessionStarting = starting;
@@ -204,6 +215,7 @@ class Chat extends EventEmitter {
     this.add({ kind: 'user', text, label: w.label || '' });
     this.said = 'user';
     this.busy = true;
+    this.progress = '';
     this.emit('state');
     try {
       if (!(await this.ensureSession())) return true;
@@ -221,9 +233,20 @@ class Chat extends EventEmitter {
       return true;
     } finally {
       this.busy = false;
+      this.progress = '';
       this.said = null;
       this.emit('state');
     }
+  }
+
+  /** Steer a running turn with a follow-up note (`_lembas/steer`). */
+  async steer(text) {
+    if (!this.busy || !this.agent || !this.session || !this.has('steer')) return false;
+    const trimmed = String(text || '').trim();
+    if (!trimmed) return false;
+    await this.agent.request('_lembas/steer', { sessionId: this.session, text: trimmed });
+    this.add({ kind: 'user', text: trimmed, label: 'sent while working' });
+    return true;
   }
 
   /** Stop the running turn. Cards still open are answered as cancelled, as ACP asks. */
@@ -231,17 +254,23 @@ class Chat extends EventEmitter {
     if (!this.agent || !this.session || !this.busy) return;
     this.agent.notify('session/cancel', { sessionId: this.session });
     for (const card of [...this.cards.values()]) this._settle(card, 'Not answered: the turn was stopped.');
+    for (const q of [...this.questions.values()]) this._settleQuestion(q, 'Not answered: the turn was stopped.');
+    for (const pl of [...this.planCards.values()]) this._settlePlan(pl, 'Not answered: the turn was stopped.');
   }
 
   /** A new session; the old one stays in the agent's own store. Resolves `false` while a turn runs. */
   async newSession() {
     if (this.busy) return false;
     for (const card of [...this.cards.values()]) this._settle(card, 'Not answered.');
+    for (const q of [...this.questions.values()]) this._settleQuestion(q, 'Not answered.');
+    for (const pl of [...this.planCards.values()]) this._settlePlan(pl, 'Not answered.');
     const agent = this.agent;
     const models = this.models;
+    const commands = this.commands;
     this._clearSession();
     this.agent = agent;
     this.models = models;
+    this.commands = commands;
     this.items = [];
     this.emit('reset');
     this.emit('state');
@@ -274,6 +303,80 @@ class Chat extends EventEmitter {
     return { models: this.models, ...this.settings };
   }
 
+  /** Slash commands & skills available in this session (`_lembas/commands`). */
+  async loadCommands() {
+    if (!this.agent || !this.session) return [];
+    const r = await this.agent.request('_lembas/commands', { sessionId: this.session });
+    const list = r && Array.isArray(r.commands) ? r.commands : [];
+    this.commands = list
+      .filter((c) => c && typeof c.name === 'string')
+      .map((c) => ({ name: String(c.name), description: String(c.description || ''), source: String(c.source || '') }));
+    this.emit('state');
+    return this.commands;
+  }
+
+  /** Search the project's file index (`_lembas/files/search`). */
+  async searchFiles(query, limit) {
+    const agent = await this.connect(true);
+    if (!agent || !agent.has('files')) return [];
+    if (!this.session && !(await this.ensureSession())) return [];
+    const r = await agent.request('_lembas/files/search', {
+      sessionId: this.session,
+      query: String(query || ''),
+      limit: limit || 30,
+    });
+    return r && Array.isArray(r.files) ? r.files.filter((f) => typeof f === 'string') : [];
+  }
+
+  /** List previous sessions in this project (`_lembas/sessions/list`). */
+  async listSessions(limit) {
+    const r = await this.request('_lembas/sessions/list', { cwd: this.io.cwd(), limit: limit || 30 });
+    return r && Array.isArray(r.sessions) ? r.sessions : [];
+  }
+
+  /** Resume a previous session and replay its transcript (`_lembas/sessions/resume`). */
+  async resumeSession(sessionId) {
+    if (this.busy) return false;
+    const agent = await this.connect(false);
+    if (!agent) return false;
+    const r = await agent.request('_lembas/sessions/resume', { sessionId });
+    if (this.agent !== agent || !r || typeof r.sessionId !== 'string') return false;
+    const models = this.models;
+    this._clearSession();
+    this.agent = agent;
+    this.models = models;
+    this.session = r.sessionId;
+    const lembas = (r._meta && r._meta.lembas) || {};
+    this.modes = (r.modes && Array.isArray(r.modes.availableModes) && r.modes.availableModes) || [];
+    this.mode = (r.modes && r.modes.currentModeId) || lembas.mode || null;
+    this.model = lembas.model || null;
+    this.items = [];
+    for (const turn of Array.isArray(r.turns) ? r.turns : []) {
+      if (turn && typeof turn.user === 'string' && turn.user.trim()) {
+        this.items.push({ id: 'i' + this.nextItem++, kind: 'user', text: turn.user, label: '' });
+      }
+      for (const t of Array.isArray(turn && turn.tools) ? turn.tools : []) {
+        this.items.push({
+          id: 'i' + this.nextItem++,
+          kind: 'tool',
+          toolCallId: String(t.id || 'h' + this.nextItem),
+          title: String(t.title || t.name || 'tool'),
+          status: t.isError ? 'failed' : 'completed',
+          files: [],
+          denied: false,
+        });
+      }
+      if (turn && typeof turn.assistant === 'string' && turn.assistant.trim()) {
+        this.items.push({ id: 'i' + this.nextItem++, kind: 'agent', text: turn.assistant });
+      }
+    }
+    this.emit('reset');
+    this.emit('state');
+    if (agent.has('editor')) this.loadModels().catch(() => {});
+    if (agent.has('commands')) this.loadCommands().catch(() => {});
+    return true;
+  }
+
   /** Read the two saved model settings, or save `set` first (`_lembas/editor/settings`). */
   async editorSettings(set) {
     const r = await this.request('_lembas/editor/settings', set ? { set } : {});
@@ -293,6 +396,12 @@ class Chat extends EventEmitter {
       for (const card of [...this.cards.values()]) {
         if (card.item.toolCallId === params.toolCallId) this._settle(card, 'Answered elsewhere, or no longer waited for.');
       }
+      for (const q of [...this.questions.values()]) {
+        if (q.item.toolCallId === params.toolCallId) this._settleQuestion(q, 'Answered elsewhere, or no longer waited for.');
+      }
+      for (const pl of [...this.planCards.values()]) {
+        if (pl.item.toolCallId === params.toolCallId) this._settlePlan(pl, 'Answered elsewhere, or no longer waited for.');
+      }
     } else if (method === '_lembas/event') {
       const ev = params.event;
       if (params.sessionId !== this.session || !ev) return;
@@ -301,6 +410,10 @@ class Chat extends EventEmitter {
         this.emit('state');
       } else if (ev.type === 'mode' && typeof ev.mode === 'string') {
         this.mode = ev.mode;
+        this.emit('state');
+      } else if (ev.type === 'phase') {
+        const p = ev.progress;
+        this.progress = p && typeof p.phase === 'string' ? p.phase.replace(/_/g, ' ') + (p.detail ? ': ' + p.detail : '') : '';
         this.emit('state');
       }
     }
@@ -340,15 +453,27 @@ class Chat extends EventEmitter {
       const entries = Array.isArray(u.entries) ? u.entries : [];
       if (!entries.length) return;
       const done = entries.filter((e) => e && e.status === 'completed').length;
-      if (!this.planItem || !this.items.includes(this.planItem)) this.planItem = this.add({ kind: 'plan', done, all: entries.length });
-      else {
+      const mapped = entries.map((e) => ({
+        content: String((e && e.content) || ''),
+        status: String((e && e.status) || 'pending'),
+      }));
+      if (!this.planItem || !this.items.includes(this.planItem)) {
+        this.planItem = this.add({ kind: 'plan', done, all: entries.length, entries: mapped });
+      } else {
         this.planItem.done = done;
         this.planItem.all = entries.length;
+        this.planItem.entries = mapped;
         this.changed(this.planItem);
       }
       this.said = 'tool';
     } else if (kind === 'current_mode_update') {
       if (typeof u.currentModeId === 'string') this.mode = u.currentModeId;
+      this.emit('state');
+    } else if (kind === 'available_commands_update') {
+      const list = Array.isArray(u.availableCommands) ? u.availableCommands : [];
+      this.commands = list
+        .filter((c) => c && typeof c.name === 'string')
+        .map((c) => ({ name: String(c.name), description: String(c.description || ''), source: '' }));
       this.emit('state');
     }
   }
@@ -356,6 +481,8 @@ class Chat extends EventEmitter {
   _onRequest(agent, method, params) {
     if (this.agent !== agent) throw { code: -32000, message: 'this client has moved on' };
     if (method === 'session/request_permission') return this._onPermission(params);
+    if (method === '_lembas/question') return this._onQuestion(params);
+    if (method === '_lembas/plan') return this._onPlan(params);
     if (method === 'fs/read_text_file') {
       if (!this.hooks.readTextFile) throw { code: -32601, message: 'Method not found: ' + method };
       return this.hooks.readTextFile(params);
@@ -403,6 +530,108 @@ class Chat extends EventEmitter {
         }
       }
     });
+  }
+
+  _onQuestion(p) {
+    const questions = (Array.isArray(p && p.questions) ? p.questions : []).map((q) => ({
+      header: String((q && q.header) || ''),
+      question: String((q && q.question) || ''),
+      multiple: !!(q && q.multiple),
+      options: (Array.isArray(q && q.options) ? q.options : []).map((o) => ({
+        label: String((o && o.label) || ''),
+        description: String((o && o.description) || ''),
+      })),
+    }));
+    const item = this.add({
+      kind: 'question',
+      toolCallId: String((p && p.toolCallId) || ''),
+      why: typeof (p && p.why) === 'string' ? p.why : '',
+      questions,
+      state: 'open',
+      answer: '',
+    });
+    this.said = 'tool';
+    return new Promise((resolve) => {
+      this.questions.set(item.id, { item, resolve });
+    });
+  }
+
+  answerQuestion(cardId, answers) {
+    const q = this.questions.get(cardId);
+    if (!q) return false;
+    this.questions.delete(cardId);
+    const list = Array.isArray(answers) ? answers.map((a) => (Array.isArray(a) ? a.map(String) : [String(a)])) : [];
+    q.item.state = 'answered';
+    q.item.answer = list.map((a) => a.join(', ')).filter(Boolean).join(' · ') || 'Answered';
+    this.changed(q.item);
+    q.resolve({ outcome: 'answered', answers: list });
+    return true;
+  }
+
+  dismissQuestion(cardId) {
+    const q = this.questions.get(cardId);
+    if (!q) return false;
+    this._settleQuestion(q, 'Dismissed.');
+    return true;
+  }
+
+  _settleQuestion(q, why) {
+    this.questions.delete(q.item.id);
+    q.item.state = 'settled';
+    q.item.answer = why;
+    this.changed(q.item);
+    q.resolve({ outcome: 'dismissed' });
+  }
+
+  _onPlan(p) {
+    const text = typeof (p && p.text) === 'string' ? p.text : '';
+    const item = this.add({
+      kind: 'plancard',
+      toolCallId: String((p && p.toolCallId) || ''),
+      path: typeof (p && p.path) === 'string' ? p.path : '',
+      title: String((p && p.plan && p.plan.title) || 'Plan ready for approval'),
+      text: text.length > DETAIL_MAX ? text.slice(0, DETAIL_MAX) + '\n…' : text,
+      plan: (p && p.plan) || null,
+      state: 'open',
+      answer: '',
+    });
+    this.said = 'tool';
+    return new Promise((resolve) => {
+      this.planCards.set(item.id, { item, resolve });
+    });
+  }
+
+  answerPlan(cardId, outcome, modeOrFeedback) {
+    const pl = this.planCards.get(cardId);
+    if (!pl) return false;
+    this.planCards.delete(cardId);
+    let reply;
+    let label;
+    if (outcome === 'approve') {
+      const m = modeOrFeedback === 'manual' ? 'manual' : 'edit';
+      reply = { outcome: 'approve', mode: m };
+      label = m === 'manual' ? 'Approved (manual mode)' : 'Approved (edit mode)';
+    } else if (outcome === 'revise') {
+      const feedback = String(modeOrFeedback || '').trim();
+      reply = { outcome: 'revise', feedback };
+      label = feedback ? 'Revision requested: ' + feedback : 'Revision requested';
+    } else {
+      reply = { outcome: 'dismiss' };
+      label = 'Dismissed';
+    }
+    pl.item.state = outcome === 'dismiss' ? 'settled' : 'answered';
+    pl.item.answer = label;
+    this.changed(pl.item);
+    pl.resolve(reply);
+    return true;
+  }
+
+  _settlePlan(pl, why) {
+    this.planCards.delete(pl.item.id);
+    pl.item.state = 'settled';
+    pl.item.answer = why;
+    this.changed(pl.item);
+    pl.resolve({ outcome: 'dismiss' });
   }
 
   /** The person's answer to a card. */

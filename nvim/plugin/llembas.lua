@@ -29,3 +29,11 @@ cmd("LLeMbasAutocompleteModel", function(o) L().autocomplete_model(o.args, o.ban
 cmd("LLeMbasMainModel", function(o) L().main_model(o.args) end,
   { nargs = "?", desc = "LLeMbas: the model for chat and rewriting, saved in your account (? shows both)" })
 cmd("LLeMbasOpen", function() L().open_shown() end, { desc = "LLeMbas: open the file the agent showed last" })
+cmd("LLeMbasFiles", function(o) L().files(o.args, o.bang) end,
+  { nargs = "?", bang = true, desc = "LLeMbas: search project files and attach @path (! opens file in editor)" })
+cmd("LLeMbasOpenFile", function(o) L().files(o.args, true) end,
+  { nargs = "?", desc = "LLeMbas: open a file from the project index" })
+cmd("LLeMbasSessions", function() L().sessions() end, { desc = "LLeMbas: list and resume a previous session" })
+cmd("LLeMbasExplain", function(o) L().explain(o.line1, o.line2) end,
+  { range = true, desc = "LLeMbas: explain the selected lines" })
+cmd("LLeMbasFix", function() L().fix() end, { desc = "LLeMbas: fix diagnostics in the current buffer" })
