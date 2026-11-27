@@ -165,7 +165,7 @@ def main():
         elif method == "initialize":
             result = {"protocolVersion": 1, "agentCapabilities": {}}
             if EDITOR:
-                result["_meta"] = {"lembas": {"capabilities": ["editor", "media", "files", "steer", "sessions", "ask", "plan"]}}
+                result["_meta"] = {"lembas": {"capabilities": ["editor", "media", "files", "commands", "steer", "sessions", "ask", "plan", "compact"]}}
             out({"jsonrpc": "2.0", "id": msg["id"], "result": result})
         elif method == "_lembas/complete":
             threading.Thread(target=complete, args=(msg,), daemon=True).start()
@@ -175,17 +175,25 @@ def main():
             pass
         elif method == "_lembas/files/search":
             q = str((msg.get("params") or {}).get("query") or "").lower()
-            sample = ["sample.py", "other.py"]
-            out({"jsonrpc": "2.0", "id": msg["id"], "result": {"files": [f for f in sample if not q or q in f.lower()]}})
+            sample = [{"path": "sample.py", "kind": "file"}, {"path": "other.py", "kind": "file"}, {"path": "sub", "kind": "dir"}]
+            out({"jsonrpc": "2.0", "id": msg["id"], "result": {"root": os.getcwd(), "files": [f for f in sample if not q or q in f["path"].lower()]}})
+        elif method == "_lembas/commands":
+            out({"jsonrpc": "2.0", "id": msg["id"], "result": {"commands": [{"name": "review", "description": "Review changes", "_meta": {"lembas": {"kind": "builtin"}}}]}})
+        elif method == "_lembas/session/compact":
+            out({"jsonrpc": "2.0", "id": msg["id"], "result": {"summary": "Compacted 1 turn."}})
         elif method == "_lembas/steer":
-            out({"jsonrpc": "2.0", "id": msg["id"], "result": {"queued": True}})
+            out({"jsonrpc": "2.0", "id": msg["id"], "result": {"queued": 1}})
         elif method == "_lembas/sessions/list":
             out({"jsonrpc": "2.0", "id": msg["id"], "result": {"sessions": [{"id": "ses_prev", "title": "Previous run", "model": "example/model-a"}]}})
         elif method == "_lembas/sessions/resume":
             out({"jsonrpc": "2.0", "id": msg["id"], "result": {
                 "sessionId": "ses_prev",
+                "title": "Previous run",
                 "modes": {"currentModeId": "edit", "availableModes": [{"id": "ask", "name": "Ask"}, {"id": "edit", "name": "Edit"}]},
-                "turns": [{"user": "old prompt", "assistant": "old reply", "tools": []}],
+                "turns": [
+                    {"role": "user", "text": "old prompt"},
+                    {"role": "assistant", "text": "old reply", "reasoning": "", "tools": [{"id": "h1", "name": "read", "args": "{}", "output": "file text"}]},
+                ],
                 "_meta": {"lembas": {"model": "example/model-a", "mode": "edit"}},
             }})
         elif method == "_lembas/edit":

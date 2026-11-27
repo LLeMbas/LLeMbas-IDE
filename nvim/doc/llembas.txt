@@ -8,27 +8,53 @@ COMMANDS                                                    *llembas-commands*
 
 :LLeMbas                                                            *:LLeMbas*
     Open or close the chat panel: the transcript, and the prompt under it.
-    In the prompt, <CR> in normal mode or <C-s> sends, <C-c> stops the turn,
-    q closes the panel.
+    In the prompt, <CR> in normal mode or <C-s> sends (or steers while busy),
+    <C-c> stops the turn, <C-x><C-f> inserts @file, <C-x><C-o> inserts a
+    /command, q closes the panel, g? opens help.
+    In the transcript, <CR> or gf opens file:line under the cursor, K inspects
+    tool output in a float, y yanks the fenced code block under the cursor, i
+    jumps into the prompt, q closes.
 
 :[range]LLeMbasAsk [question]                                    *:LLeMbasAsk*
     Ask about the lines of [range]. They are sent as the buffer has them,
     saved or not, with the file, the line numbers and the diagnostics on them.
     Without a question the lines are attached to the next message you type.
 
+:[range]LLeMbasExplain                                       *:LLeMbasExplain*
+    Ask the agent to explain the selected lines concisely.
+
+:LLeMbasFix                                                      *:LLeMbasFix*
+    Send the current buffer's reported diagnostics to the agent to fix.
+
 :[range]LLeMbasEdit [instruction]                               *:LLeMbasEdit*
     Have the lines of [range] rewritten. The result is shown in place as
     changes: old lines marked, new lines beside them. Nothing is written
     until you accept. ga accepts the change under the cursor, gr rejects it,
-    gA and gR do all. (With a LLeMbas CLI older than harness spec 3.11.0 the
-    agent edits the saved file on disk instead.)
+    gA and gR do all, ]h and [h jump between changes.
+
+:LLeMbasGenerate [instruction]                             *:LLeMbasGenerate*
+    Generate code at the cursor line and show it as inline proposed hunks.
+
+:LLeMbasCancelEdit                                       *:LLeMbasCancelEdit*
+    Cancel an in-flight rewrite or generation in the current buffer.
 
 :LLeMbasAccept[!]  :LLeMbasReject[!]            *:LLeMbasAccept* *:LLeMbasReject*
     Accept or reject the change under the cursor; with ! all of them.
 
+:LLeMbasNextHunk  :LLeMbasPrevHunk            *:LLeMbasNextHunk* *:LLeMbasPrevHunk*
+    Jump to the next or previous proposed change in the current buffer.
+
 :LLeMbasAutocomplete [on|off]                           *:LLeMbasAutocomplete*
-    Suggestions as you type. While typing, <Tab> accepts a shown suggestion
-    and <M-\> asks for one now.
+    Suggestions as you type. While typing, <Tab> accepts a shown suggestion,
+    <M-Right> accepts the next word, and <M-\> asks for one now.
+
+:LLeMbasAutocompleteTokens [N|auto|words|line|block|file] *:LLeMbasAutocompleteTokens*
+    Configure how much autocomplete predicts (max tokens up to 4096 and/or a
+    length preset: auto, words, line, block, file). Without an argument, opens
+    a picker with presets and a custom token count input.
+
+:LLeMbasAutocompleteInstructions [text|-]         *:LLeMbasAutocompleteInstructions*
+    Set custom instructions sent with autocomplete requests ("-" clears them).
 
 :LLeMbasAutocompleteModel[!] [model]               *:LLeMbasAutocompleteModel*
     The model that writes suggestions, saved in your account; without a name,
@@ -39,27 +65,52 @@ COMMANDS                                                    *llembas-commands*
     The model for chat and rewriting, saved in your account. "?" shows both
     settings.
 
+:LLeMbasFiles[!] [query]                                       *:LLeMbasFiles*
+    Search the project file index and insert @path into the prompt (! opens
+    the chosen file directly in the editing window).
+
+:LLeMbasOpenFile [query]                                    *:LLeMbasOpenFile*
+    Open a file from the project index.
+
+:LLeMbasCommands                                            *:LLeMbasCommands*
+    Pick an available /command or skill and insert it into the prompt.
+
+:LLeMbasSessions                                            *:LLeMbasSessions*
+    List previous sessions in this directory and resume one with its history.
+
+:LLeMbasCompact                                              *:LLeMbasCompact*
+    Compact the active session's conversation context.
+
+:LLeMbasToggleThoughts                                *:LLeMbasToggleThoughts*
+    Toggle showing model thinking in the transcript.
+
 :LLeMbasOpen                                                    *:LLeMbasOpen*
     Open the file the agent showed last with the system's viewer.
 
 :LLeMbasStop                                                    *:LLeMbasStop*
     Stop the running turn.
 
-:LLeMbasNew                                                      *:LLeMbasNew*
-    Start a new session. The old one stays in the CLI's store.
+:LLeMbasNew[!]                                                   *:LLeMbasNew*
+    Start a new session (! ends a hung turn). Old sessions stay in the CLI.
 
 :LLeMbasMode [mode]                                             *:LLeMbasMode*
-    Change the session's mode; without an argument, pick from a list.
+    Change the session's mode (works live mid-turn); without an arg, pick.
 
 :LLeMbasModel [model]                                          *:LLeMbasModel*
-    Show the session's model, or change it to one your server serves.
+    Pick or change the session's model.
+
+:LLeMbasStatus  :LLeMbasHelp                     *:LLeMbasStatus* *:LLeMbasHelp*
+    Open floating status overview or commands & keymaps reference.
 
 ==============================================================================
 SETUP                                                          *llembas-setup*
 >lua
     require("llembas").setup({
       cmd = { "lembas", "serve", "--stdio" },  -- the agent
+      position = "right",      -- "right" | "left" | "bottom" | "float"
       width = 64,              -- the panel's columns
+      prompt_height = 5,       -- the prompt window's rows
+      border = "rounded",      -- border style for floating windows
       mode = nil,              -- the mode a session starts in
       model = nil,             -- the model a session starts on
       show_thoughts = false,   -- the model's thinking in the transcript
@@ -68,11 +119,21 @@ SETUP                                                          *llembas-setup*
         auto = true,           -- suggest as you type
         debounce_ms = 250,     -- the pause before a suggestion is asked for
         model = nil,           -- a model for this editor only
+        max_tokens = nil,      -- max tokens to predict (nil: server default)
+        length = "auto",       -- "auto" | "words" | "line" | "block" | "file"
+        instructions = "",     -- custom autocomplete instructions
         accept = "<Tab>",      -- accepts a shown suggestion
+        accept_word = "<M-Right>", -- accepts next word of suggestion
         trigger = "<M-\\>",    -- asks for a suggestion now
       },
     })
 <
+Statusline component: `require("llembas").statusline()`.
+Highlights: `LLeMbasBrand`, `LLeMbasUserHeader`, `LLeMbasAgentHeader`,
+`LLeMbasThought`, `LLeMbasToolPending`, `LLeMbasToolDone`, `LLeMbasToolFail`,
+`LLeMbasToolDenied`, `LLeMbasPlanHeader`, `LLeMbasDiffAdd`, `LLeMbasDiffDelete`,
+`LLeMbasDiffHint`, `LLeMbasGhost`, `LLeMbasSeparator` (all `default = true`).
+
 What the model writes is shown as text. It is never run, and the panel's
 buffers read no modeline.
 

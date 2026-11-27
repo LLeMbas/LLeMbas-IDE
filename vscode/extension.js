@@ -104,6 +104,9 @@ class Proposals {
     this.removed = vscode.window.createTextEditorDecorationType({
       isWholeLine: true,
       backgroundColor: new vscode.ThemeColor('diffEditor.removedLineBackground'),
+      borderWidth: '0 0 0 3px',
+      borderStyle: 'solid',
+      borderColor: new vscode.ThemeColor('editorOverviewRuler.deletedForeground'),
       overviewRulerColor: new vscode.ThemeColor('editorOverviewRuler.modifiedForeground'),
       overviewRulerLane: vscode.OverviewRulerLane.Left,
     });
@@ -334,6 +337,7 @@ class ChatView {
       nonce: crypto.randomBytes(18).toString('base64url'),
       scriptUri: webview.asWebviewUri(vscode.Uri.joinPath(this.context.extensionUri, 'media', 'chat.js')).toString(),
       styleUri: webview.asWebviewUri(vscode.Uri.joinPath(this.context.extensionUri, 'media', 'chat.css')).toString(),
+      logoUri: webview.asWebviewUri(vscode.Uri.joinPath(this.context.extensionUri, 'media', 'logo.png')).toString(),
     });
     webview.onDidReceiveMessage((m) => this.receive(m));
     view.onDidDispose(() => {
@@ -351,6 +355,10 @@ class ChatView {
       let growing = this.reading.get(item.id);
       if (!growing) this.reading.set(item.id, (growing = new markdown.Growing()));
       return { id: item.id, kind: 'agent', ast: growing.update(item.text) };
+    }
+    if (item.kind === 'plancard') {
+      const { text, ...rest } = item;
+      return { ...rest, ast: text ? markdown.parse(text) : [] };
     }
     if (item.kind === 'media') {
       const entry = this.shown.get(item.key);
@@ -385,6 +393,7 @@ class ChatView {
       type: 'reset',
       items: this.chat.items.map((i) => this.present(i)),
       state: this.chat.state(),
+      settings: this.actions.uiSettings ? this.actions.uiSettings() : undefined,
       attached: this.attached ? this.attached.label : '',
     });
   }
@@ -418,10 +427,27 @@ class ChatView {
         return this.chat.stop();
       case 'new':
         return a.newSession();
+      case 'compact':
+        return a.guard(a.compact());
       case 'sessions':
         return a.guard(a.resumeSession());
+      case 'explain':
+        return a.guard(a.explain());
+      case 'fix':
+        return a.guard(a.fixProblems());
       case 'addFile':
         return a.guard(a.addFile());
+      case 'copyCode':
+        if (typeof m.text === 'string' && vscode.env && vscode.env.clipboard && typeof vscode.env.clipboard.writeText === 'function') {
+          vscode.env.clipboard.writeText(m.text).then(undefined, () => {});
+        }
+        return undefined;
+      case 'insertCode':
+        if (typeof m.text === 'string') a.guard(a.insertCode(m.text));
+        return undefined;
+      case 'updateSettings':
+        if (m.settings && typeof m.settings === 'object') a.guard(a.updateSettings(m.settings));
+        return undefined;
       case 'searchFiles':
         if (typeof m.query === 'string') {
           const seq = m.seq;
@@ -660,38 +686,46 @@ function activate(context) {
     const fromAgent = await chat.searchFiles(query, 40).catch(() => []);
     if (fromAgent.length) return fromAgent;
     const root = workingDirectory();
+    const seenPaths = new Set();
     const openRel = [];
     for (const d of vscode.workspace.textDocuments) {
       if (d.uri.scheme !== 'file') continue;
       const rel = path.relative(root, d.uri.fsPath).replace(/\\/g, '/');
-      if (rel && !rel.startsWith('..') && (!query || rel.toLowerCase().includes(query.toLowerCase()))) openRel.push(rel);
+      if (rel && !rel.startsWith('..') && !seenPaths.has(rel) && (!query || rel.toLowerCase().includes(query.toLowerCase()))) {
+        seenPaths.add(rel);
+        openRel.push({ path: rel, kind: 'file' });
+      }
     }
-    return [...new Set(openRel)];
+    return openRel;
   }
 
-  async function pickProjectFile(title) {
-    const files = await searchProjectFiles('');
+  async function pickProjectFile(title, allowDirs) {
+    const files = (await searchProjectFiles('')).filter((f) => allowDirs || f.kind !== 'dir');
     if (!files.length) {
       vscode.window.showInformationMessage('LLeMbas: no files found in the project index.');
       return undefined;
     }
     const picked = await vscode.window.showQuickPick(
-      files.map((f) => ({ label: f })),
+      files.map((f) => ({
+        label: (f.kind === 'dir' ? '$(folder) ' : '$(file) ') + f.path + (f.kind === 'dir' ? '/' : ''),
+        entry: f,
+      })),
       { title, placeHolder: 'Type to filter project files' },
     );
-    return picked ? picked.label : undefined;
+    return picked ? picked.entry : undefined;
   }
 
   async function openIndexedFile() {
-    const rel = await pickProjectFile('LLeMbas: open file from project index');
-    if (rel) await openFileAt(rel);
+    const entry = await pickProjectFile('LLeMbas: open file from project index', false);
+    if (entry) await openFileAt(entry.path);
   }
 
   async function addFileToChat() {
-    const rel = await pickProjectFile('LLeMbas: add file to chat');
-    if (!rel) return;
+    const entry = await pickProjectFile('LLeMbas: add file to chat', true);
+    if (!entry) return;
     await view.reveal(true);
-    view.post({ type: 'insertText', text: `@${rel} ` });
+    const escaped = entry.path.replace(/([ #])/g, '\\$1') + (entry.kind === 'dir' ? '/' : '');
+    view.post({ type: 'insertText', text: `@${escaped} ` });
   }
 
   async function resumeSession() {
@@ -717,6 +751,69 @@ function activate(context) {
     return undefined;
   }
 
+  function uiSettings() {
+    const c = config();
+    return {
+      auto: !!c.get('complete.auto'),
+      maxTokens: Number(c.get('complete.maxTokens')) || 0,
+      length: String(c.get('complete.length') || 'auto'),
+      instructions: String(c.get('complete.instructions') || ''),
+      showThinking: !!c.get('chat.showThinking'),
+    };
+  }
+
+  async function updateSettings(patch) {
+    const c = config();
+    if (typeof c.update !== 'function') return;
+    const target = vscode.ConfigurationTarget ? vscode.ConfigurationTarget.Global : true;
+    const tasks = [];
+    if (typeof patch.auto === 'boolean') tasks.push(c.update('complete.auto', patch.auto, target));
+    if (typeof patch.maxTokens === 'number' && Number.isFinite(patch.maxTokens)) {
+      const clamped = Math.max(0, Math.min(4096, Math.round(patch.maxTokens)));
+      tasks.push(c.update('complete.maxTokens', clamped, target));
+    }
+    if (typeof patch.length === 'string' && ['auto', 'words', 'line', 'block', 'file'].includes(patch.length)) {
+      tasks.push(c.update('complete.length', patch.length, target));
+    }
+    if (typeof patch.instructions === 'string') {
+      tasks.push(c.update('complete.instructions', patch.instructions.slice(0, 2000), target));
+    }
+    if (typeof patch.showThinking === 'boolean') tasks.push(c.update('chat.showThinking', patch.showThinking, target));
+    await Promise.all(tasks);
+    view.post({ type: 'settings', settings: uiSettings() });
+    showStatus();
+  }
+
+  async function insertCode(text) {
+    const editor = vscode.window.activeTextEditor;
+    if (!editor) return vscode.window.showInformationMessage('LLeMbas: open an editor to insert code.');
+    const doc = editor.document;
+    const eol = doc.eol === vscode.EndOfLine.CRLF ? '\r\n' : '\n';
+    const edit = new vscode.WorkspaceEdit();
+    edit.replace(doc.uri, editor.selection, String(text).replace(/\r\n/g, '\n').replace(/\n/g, eol));
+    await vscode.workspace.applyEdit(edit);
+    return undefined;
+  }
+
+  async function compactSession() {
+    if (chat.busy) return vscode.window.showWarningMessage('LLeMbas is working. Stop it first.');
+    if (!chat.session) return vscode.window.showInformationMessage('LLeMbas: start a session first.');
+    await chat.compact();
+    return undefined;
+  }
+
+  async function toggleAutocomplete() {
+    const c = config();
+    const next = !c.get('complete.auto');
+    if (typeof c.update === 'function') {
+      const target = vscode.ConfigurationTarget ? vscode.ConfigurationTarget.Global : true;
+      await c.update('complete.auto', next, target);
+    }
+    view.post({ type: 'settings', settings: uiSettings() });
+    showStatus();
+    vscode.window.showInformationMessage(`LLeMbas: autocomplete as you type is ${next ? 'on' : 'off'}.`);
+  }
+
   const actions = {
     mediaDir,
     guard,
@@ -724,6 +821,12 @@ function activate(context) {
     searchFiles: searchProjectFiles,
     resumeSession,
     addFile: addFileToChat,
+    compact: compactSession,
+    explain: () => explain(),
+    fixProblems: () => fixProblems(),
+    insertCode,
+    uiSettings,
+    updateSettings,
     async sendTyped(text) {
       if (chat.busy) {
         if (chat.has('steer')) return chat.steer(text);
@@ -806,49 +909,76 @@ function activate(context) {
     const editor = vscode.window.activeTextEditor;
     if (!editor) return vscode.window.showInformationMessage('LLeMbas: open an editor first.');
     const doc = editor.document;
-    const line = editor.selection.active.line;
-    const instruction = await vscode.window.showInputBox({
-      title: 'Generate code at cursor',
-      placeHolder: 'Describe the code to write here',
-    });
-    if (!instruction || !instruction.trim()) return undefined;
+    const key = doc.uri.toString();
     if (proposals.pending(doc)) return vscode.window.showWarningMessage('LLeMbas: accept or reject the changes shown in this file first.');
-    if (!(await chat.connect(false))) return vscode.window.showErrorMessage(say(chat.startError || 'the agent did not start'));
-    if (!chat.has('editor')) return vscode.window.showWarningMessage('LLeMbas: this LLeMbas CLI cannot rewrite/generate yet. Update the CLI.');
-    const lines = (from, to) => {
-      const out = [];
-      for (let i = Math.max(0, from); i <= Math.min(doc.lineCount - 1, to); i++) out.push(doc.lineAt(i).text);
-      return out;
-    };
-    const old = [doc.lineAt(line).text];
-    const versionThen = doc.version;
-    const id = 'e' + ++rewrites;
-    const params = {
-      id,
-      cwd: workingDirectory(),
-      text: old.join('\n') || ' ',
-      before: lines(line - 40, line - 1).join('\n'),
-      after: lines(line + 1, line + 40).join('\n'),
-      language: doc.languageId,
-      instruction: `At this line, ${instruction.trim()}`,
-    };
-    if (doc.uri.scheme === 'file') params.path = doc.uri.fsPath;
-    if (chat.session) params.sessionId = chat.session;
-    if (windowModel.main) params.model = windowModel.main;
-    let r;
+    if (rewriting.has(key)) return vscode.window.showWarningMessage('LLeMbas: a rewrite of this file is still being written.');
+    rewriting.add(key);
     try {
-      r = await chat.request('_lembas/edit', params);
-    } catch (e) {
-      return vscode.window.showErrorMessage(say(e));
+      const line = editor.selection.active.line;
+      const instruction = await vscode.window.showInputBox({
+        title: 'Generate code at cursor',
+        placeHolder: 'Describe the code to write here',
+      });
+      if (!instruction || !instruction.trim()) return undefined;
+      if (!(await chat.connect(false))) return vscode.window.showErrorMessage(say(chat.startError || 'the agent did not start'));
+      if (!chat.has('editor')) return vscode.window.showWarningMessage('LLeMbas: this LLeMbas CLI cannot rewrite/generate yet. Update the CLI.');
+      const lines = (from, to) => {
+        const out = [];
+        for (let i = Math.max(0, from); i <= Math.min(doc.lineCount - 1, to); i++) out.push(doc.lineAt(i).text);
+        return out;
+      };
+      const old = [doc.lineAt(line).text];
+      const versionThen = doc.version;
+      const id = 'e' + ++rewrites;
+      const params = {
+        id,
+        cwd: workingDirectory(),
+        text: old.join('\n') || ' ',
+        before: lines(line - 40, line - 1).join('\n'),
+        after: lines(line + 1, line + 40).join('\n'),
+        language: doc.languageId,
+        instruction: `At this line, ${instruction.trim()}`,
+      };
+      if (doc.uri.scheme === 'file') params.path = doc.uri.fsPath;
+      if (chat.session) params.sessionId = chat.session;
+      if (windowModel.main) params.model = windowModel.main;
+      let r;
+      try {
+        r = await vscode.window.withProgress(
+          { location: vscode.ProgressLocation.Notification, title: 'LLeMbas is generating…', cancellable: true },
+          async (progress, token) => {
+            let written = 0;
+            const onDelta = (p) => {
+              if (!p || p.id !== id || typeof p.delta !== 'string') return;
+              written += p.delta.length;
+              progress.report({ message: `${written} characters` });
+            };
+            chat.on('editDelta', onDelta);
+            token.onCancellationRequested(() => chat.notify('_lembas/edit/cancel', { id }));
+            try {
+              return await chat.request('_lembas/edit', params);
+            } finally {
+              chat.off('editDelta', onDelta);
+            }
+          },
+        );
+      } catch (e) {
+        return vscode.window.showErrorMessage(say(e));
+      }
+      if (!r || r.cancelled || typeof r.text !== 'string' || doc.isClosed) return undefined;
+      if (doc.version !== versionThen) {
+        return vscode.window.showWarningMessage('LLeMbas: the file changed while the code was generated, so nothing is shown. Ask again.');
+      }
+      const fresh = hunksOf.splitLines(r.text);
+      if (fresh.length > 1 && fresh[fresh.length - 1] === '') fresh.pop();
+      const hunks = hunksOf.propose(line, old, fresh);
+      if (!hunks.length) return vscode.window.showInformationMessage('LLeMbas: nothing to insert.');
+      proposals.set(doc, hunks);
+      if (config().get('rewrite.openDiff')) proposals.showDiff(doc).then(undefined, () => {});
+      return undefined;
+    } finally {
+      rewriting.delete(key);
     }
-    if (!r || r.cancelled || typeof r.text !== 'string' || doc.isClosed || doc.version !== versionThen) return undefined;
-    const fresh = hunksOf.splitLines(r.text);
-    if (fresh.length > 1 && fresh[fresh.length - 1] === '') fresh.pop();
-    const hunks = hunksOf.propose(line, old, fresh);
-    if (!hunks.length) return undefined;
-    proposals.set(doc, hunks);
-    if (config().get('rewrite.openDiff')) proposals.showDiff(doc).then(undefined, () => {});
-    return undefined;
   }
 
   // ---- rewrite a selection ----
@@ -964,6 +1094,8 @@ function activate(context) {
     debounceMs: () => Number(config().get('complete.debounce')),
     model: () => windowModel.autocomplete,
     maxTokens: () => Number(config().get('complete.maxTokens')) || undefined,
+    length: () => String(config().get('complete.length') || 'auto'),
+    instructions: () => String(config().get('complete.instructions') || ''),
     onRefusal(reason, message) {
       if (reason === 'no_model' || reason === 'not_allowed') {
         const text = reason === 'no_model' ? message || 'No autocomplete model is chosen.' : message || 'That model is not allowed for autocomplete.';
@@ -1051,10 +1183,22 @@ function activate(context) {
   function showStatus() {
     const saved = chat.settings && chat.settings.autocomplete && chat.settings.autocomplete.model;
     const model = windowModel.autocomplete || saved;
-    status.text = 'LLeMbas' + (model ? ': ' + String(model).split('/').pop() : '');
-    status.tooltip = model
-      ? `Autocomplete model: ${model}${windowModel.autocomplete ? ' (this window only)' : ''}. Click to change the models.`
-      : 'LLeMbas: choose the models';
+    const autoOn = !!config().get('complete.auto');
+    const maxTok = Number(config().get('complete.maxTokens')) || 0;
+    const len = String(config().get('complete.length') || 'auto');
+    const icon = chat.busy ? '$(sync~spin) ' : '$(sparkle) ';
+    const suffix = model ? ': ' + String(model).split('/').pop() : '';
+    status.text = icon + 'LLeMbas' + suffix + (autoOn ? '' : ' (off)');
+    const lines = [
+      model
+        ? `Autocomplete model: ${model}${windowModel.autocomplete ? ' (this window only)' : ''}`
+        : 'Autocomplete model: not chosen',
+      `Autocomplete: ${autoOn ? 'on' : 'off'} · scope: ${len}${maxTok ? ` · max ${maxTok} tokens` : ''}`,
+    ];
+    if (chat.mode) lines.push(`Session mode: ${chat.mode}`);
+    if (chat.model) lines.push(`Session model: ${chat.model}`);
+    lines.push('Click to change models.');
+    status.tooltip = lines.join('\n');
     status.show();
   }
   showStatus();
@@ -1155,6 +1299,7 @@ function activate(context) {
   command('llembas.open', () => view.reveal(true));
   command('llembas.newSession', actions.newSession);
   command('llembas.resumeSession', resumeSession);
+  command('llembas.compact', compactSession);
   command('llembas.stop', () => chat.stop());
   command('llembas.restart', () => chat.stopAgent());
   command('llembas.ask', ask);
@@ -1163,6 +1308,7 @@ function activate(context) {
   command('llembas.generate', generateAtCursor);
   command('llembas.rewrite', rewrite);
   command('llembas.complete', () => vscode.commands.executeCommand('editor.action.inlineSuggest.trigger'));
+  command('llembas.toggleAutocomplete', toggleAutocomplete);
   command('llembas.openFile', openIndexedFile);
   command('llembas.addFile', addFileToChat);
   command('llembas.chooseMode', chooseMode);
@@ -1207,6 +1353,10 @@ function activate(context) {
     vscode.workspace.onDidChangeConfiguration((ev) => {
       // Another command for the agent: the running one is stopped, and the next request starts the new one.
       if (ev.affectsConfiguration('llembas.command')) chat.stopAgent();
+      if (ev.affectsConfiguration('llembas.complete') || ev.affectsConfiguration('llembas.chat.showThinking')) {
+        view.post({ type: 'settings', settings: uiSettings() });
+        showStatus();
+      }
     }),
     proposals.removed,
     proposals.added,

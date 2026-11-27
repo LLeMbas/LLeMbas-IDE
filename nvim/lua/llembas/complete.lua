@@ -4,23 +4,58 @@
 local M = {}
 local ns = vim.api.nvim_create_namespace("llembas-complete")
 
-local st = { timer = nil, seq = 0, asked = nil, shown = nil, off = nil, said = false, last_warm = nil }
+local st = { timer = nil, seq = 0, asked = nil, shown = nil, off = nil, said = false, last_warm = nil, installed = false }
 
 local PREFIX_MAX, SUFFIX_MAX = 16000, 4000
+local REFUSALS = { no_model = true, not_allowed = true, not_logged_in = true, unsupported = true }
+
+local LENGTH_PRESETS = {
+  auto = { tokens = nil, instruction = "" },
+  words = {
+    tokens = 24,
+    instruction = "Predict only a few words to finish the current expression or identifier. Stop immediately once the current token or phrase is complete.",
+  },
+  line = {
+    tokens = 64,
+    instruction = "Predict at most the remainder of the current line. Do not start a new line.",
+  },
+  block = {
+    tokens = 256,
+    instruction = "Predict a complete statement, block, or function body fitting the surrounding code.",
+  },
+  file = {
+    tokens = 2048,
+    instruction = "Predict a comprehensive continuation, up to a full multi-function section or file implementation when appropriate.",
+  },
+}
 
 local function L() return require("llembas") end
+
+local function resolve_prediction()
+  local c = L().config.complete or {}
+  local preset = LENGTH_PRESETS[c.length or "auto"] or LENGTH_PRESETS.auto
+  local explicit = tonumber(c.max_tokens)
+  local max_tokens = (explicit and explicit > 0) and math.floor(explicit) or preset.tokens
+  local parts = {}
+  if preset.instruction ~= "" then parts[#parts + 1] = preset.instruction end
+  if type(c.instructions) == "string" and c.instructions:match("%S") then parts[#parts + 1] = vim.trim(c.instructions) end
+  local guidance = table.concat(parts, "\n")
+  return max_tokens, guidance ~= "" and guidance or nil
+end
 
 --- Whether you are typing (insert mode). A function of its own so the tests, which cannot stay in
 --- insert mode in a headless run, can say yes.
 function M._typing() return vim.api.nvim_get_mode().mode:sub(1, 1) == "i" end
 
---- The accept key is ours only while a suggestion is on the screen: a buffer mapping put there with
---- the suggestion and taken away with it, whatever was mapped before given back as it was.
+--- The accept keys are ours only while a suggestion is on the screen: buffer mappings put there
+--- with the suggestion and taken away with it, whatever was mapped before given back as it was.
 local function unmap_accept()
   local s = st.shown
-  if not s or not s.key then return end
-  pcall(vim.keymap.del, "i", s.key, { buffer = s.buf })
-  if s.before and next(s.before) and s.before.buffer == 1 then pcall(vim.fn.mapset, "i", false, s.before) end
+  if not s or not s.maps then return end
+  for _, m in ipairs(s.maps) do
+    pcall(vim.keymap.del, "i", m.key, { buffer = s.buf })
+    if m.before and next(m.before) and m.before.buffer == 1 then pcall(vim.fn.mapset, "i", false, m.before) end
+  end
 end
 
 function M.clear()
@@ -40,19 +75,25 @@ local function cancel()
 end
 
 local function show(buf, row, col, text)
+  require("llembas.ui").setup_highlights()
   M.clear()
   local lines = vim.split(text, "\n", { plain = true })
-  local opts = { virt_text = { { lines[1], "Comment" } }, virt_text_pos = "inline" }
+  local opts = { virt_text = { { lines[1], "LLeMbasGhost" } }, virt_text_pos = "inline" }
   if #lines > 1 then
     opts.virt_lines = {}
-    for i = 2, #lines do opts.virt_lines[#opts.virt_lines + 1] = { { lines[i], "Comment" } } end
+    for i = 2, #lines do opts.virt_lines[#opts.virt_lines + 1] = { { lines[i], "LLeMbasGhost" } } end
   end
-  st.shown = { buf = buf, text = text, mark = vim.api.nvim_buf_set_extmark(buf, ns, row, col, opts) }
-  local key = L().config.complete.accept
-  if key and key ~= "" then
+  st.shown = { buf = buf, text = text, mark = vim.api.nvim_buf_set_extmark(buf, ns, row, col, opts), maps = {} }
+  local c = L().config.complete
+  local function bind(key, fn, desc)
+    if not key or key == "" then return end
     local before = vim.fn.maparg(key, "i", false, true)
-    st.shown.key, st.shown.before = key, before
-    vim.keymap.set("i", key, function() M.accept() end, { buffer = buf, nowait = true, desc = "LLeMbas: accept the suggestion" })
+    st.shown.maps[#st.shown.maps + 1] = { key = key, before = before }
+    vim.keymap.set("i", key, fn, { buffer = buf, nowait = true, desc = desc })
+  end
+  bind(c.accept, function() M.accept() end, "LLeMbas: accept the suggestion")
+  if c.accept_word and c.accept_word ~= "" and c.accept_word ~= c.accept then
+    bind(c.accept_word, function() M.accept_word() end, "LLeMbas: accept next word of suggestion")
   end
 end
 
@@ -133,25 +174,40 @@ function M.request(manual)
     local id = ("c%d"):format(seq)
     st.asked = id
     local name = vim.api.nvim_buf_get_name(buf)
-    conn:request("_lembas/complete", {
+    local max_tokens, guidance = resolve_prediction()
+    local params = {
       id = id, prefix = prefix, suffix = suffix, path = name ~= "" and name or nil,
       language = vim.bo[buf].filetype ~= "" and vim.bo[buf].filetype or nil,
       cwd = vim.fn.getcwd(),
       sessionId = L()._state.session,
       open = open_snippets(buf),
       model = L().config.complete.model,
-    }, function(err, r)
+      max_tokens = max_tokens,
+    }
+    if guidance then
+      params.context = { { path = "llembas:autocomplete-instructions", text = guidance } }
+    end
+    conn:request("_lembas/complete", params, function(err, r)
       if st.asked == id then st.asked = nil end
       if seq ~= st.seq then return end
       if err then
-        -- Asked on every pause, so a refusal is said once and the asking stops until you choose.
-        st.off = tostring(err.message)
-        if manual or not st.said then
-          st.said = true
-          vim.notify("LLeMbas: no suggestions: " .. st.off .. " (:LLeMbasAutocompleteModel chooses a model)", vim.log.levels.WARN)
+        local reason = (type(err.data) == "table" and type(err.data.reason) == "string") and err.data.reason or ""
+        local msg = tostring(err.message or "completion failed")
+        if REFUSALS[reason] or reason == "" then
+          -- Permanent refusal (e.g. no model): said once, stops asking until a model is chosen.
+          st.off = msg
+          if manual or not st.said then
+            st.said = true
+            vim.notify("LLeMbas: no suggestions: " .. st.off .. " (:LLeMbasAutocompleteModel chooses a model)", vim.log.levels.WARN)
+          end
+        else
+          -- Transient server failure: pause briefly instead of shutting off permanently.
+          st.wait_until = vim.uv.now() + 15000
+          if manual then vim.notify("LLeMbas: " .. msg, vim.log.levels.WARN) end
         end
         return
       end
+      if manual and st.off then st.off, st.said = nil, false end
       if not r or r.cancelled or type(r.text) ~= "string" or r.text == "" then return end
       if vim.api.nvim_get_current_buf() ~= buf or not M._typing() then return end
       local now = vim.api.nvim_win_get_cursor(0)
@@ -179,18 +235,51 @@ function M.accept()
   return true
 end
 
+--- Accept only the next word (or line break) of the shown suggestion, keeping the rest visible.
+function M.accept_word()
+  local s = st.shown
+  if not s or s.buf ~= vim.api.nvim_get_current_buf() then return false end
+  local pos = vim.api.nvim_buf_get_extmark_by_id(s.buf, ns, s.mark, {})
+  if not pos[1] then M.clear(); return false end
+  local chunk = s.text:match("^%s*[%w_]+") or s.text:match("^%s*[^\n%s]") or s.text:match("^\n[ \t]*") or s.text
+  if chunk == s.text then return M.accept() end
+  local rest = s.text:sub(#chunk + 1)
+  local buf = s.buf
+  M.clear()
+  st.seq = st.seq + 1
+  local at_row, at_col = pos[1], pos[2]
+  local lines = vim.split(chunk, "\n", { plain = true })
+  vim.api.nvim_buf_set_text(buf, at_row, at_col, at_row, at_col, lines)
+  local new_row = at_row + #lines
+  local new_col = #lines == 1 and (at_col + #lines[1]) or #lines[#lines]
+  vim.api.nvim_win_set_cursor(0, { new_row, new_col })
+  if rest ~= "" then show(buf, new_row - 1, new_col, rest) end
+  return true
+end
+
+function M.dismiss()
+  M.clear()
+  cancel()
+end
+
 function M.visible() return st.shown ~= nil end
 
 --- Suggestions as you type: on, off, or the other of the two.
 function M.auto(on)
   local c = L().config.complete
   if on == nil then c.auto = not c.auto else c.auto = on end
-  if c.auto then st.off, st.said = nil, false else M.clear(); cancel() end
+  if c.auto then
+    if not st.installed then M.setup() end
+    st.off, st.said = nil, false
+  else
+    M.clear()
+    cancel()
+  end
   return c.auto
 end
 
---- A model was chosen: ask again.
-function M.reset() st.off, st.said, st.last_warm = nil, false, nil end
+--- A model or token/instruction setting was chosen: ask again.
+function M.reset() st.off, st.said, st.last_warm, st.wait_until = nil, false, nil, nil end
 
 local function typed()
   M.clear()
@@ -205,6 +294,7 @@ local function typed()
 end
 
 function M.setup()
+  st.installed = true
   local group = vim.api.nvim_create_augroup("llembas-complete", { clear = true })
   vim.api.nvim_create_autocmd({ "TextChangedI", "CursorMovedI" }, { group = group, callback = typed })
   vim.api.nvim_create_autocmd({ "InsertLeave", "BufLeave" }, { group = group, callback = function() M.clear(); cancel() end })

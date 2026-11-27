@@ -2,6 +2,8 @@
 local M = {}
 M.__index = M
 
+local MAX_BUF_BYTES = 64 * 1024 * 1024 -- 64 MB cap against an unbounded unterminated stream
+
 --- Start `cmd` and speak JSON-RPC with it. `on.request(method, params, reply)` and
 --- `on.notify(method, params)` run on the main loop; `on.exit(code, stderr)` when the process ends.
 function M.start(cmd, on, opts)
@@ -32,6 +34,11 @@ function M.start(cmd, on, opts)
 end
 
 function M:_feed(data)
+  if #self.buf + #data > MAX_BUF_BYTES then
+    -- Drop oversized unterminated line rather than exhausting editor memory.
+    self.buf = ""
+    return
+  end
   self.buf = self.buf .. data
   while true do
     local nl = self.buf:find("\n", 1, true)

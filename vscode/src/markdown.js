@@ -5,8 +5,9 @@
 // text. No `vscode` here.
 //
 // Blocks:  { t: 'p', c }  { t: 'h', l, c }  { t: 'pre', lang, v }  { t: 'hr' }
-//          { t: 'quote', c: blocks }  { t: 'ul' | 'ol', items: [{ d, c }] }  { t: 'plain', v }
-// Inline:  { t: 'text', v }  { t: 'code', v }  { t: 'b', c }  { t: 'i', c }
+//          { t: 'quote', c: blocks }  { t: 'ul' | 'ol', items: [{ d, checked?, c }] }
+//          { t: 'table', align: string[], head: Inline[][], rows: Inline[][][] }  { t: 'plain', v }
+// Inline:  { t: 'text', v }  { t: 'code', v }  { t: 'b', c }  { t: 'i', c }  { t: 'del', c }
 //          { t: 'a', href, c }  { t: 'br' }
 
 const MAX_DEPTH = 6;
@@ -19,6 +20,7 @@ const MAX_CHARS = 400000;
 const MAX_LINE = 4000;
 const BUDGET = 400000;
 const LABEL_MAX = 1000;
+const MAX_TABLE_COLS = 24;
 
 /** A link the chat may offer to open: http, https or mailto, and nothing else. */
 function safeHref(url) {
@@ -114,6 +116,20 @@ function parseInline(s, depth, budget) {
       i += n;
       continue;
     }
+    if (!deep && ch === '~' && s[i + 1] === '~') {
+      const next = s[i + 2];
+      if (next !== undefined && !/\s/.test(next)) {
+        const close = findClosing(s, i + 2, '~~', work);
+        if (close > 0) {
+          out.push({ t: 'del', c: parseInline(s.slice(i + 2, close), (depth || 0) + 1, work) });
+          i = close + 2;
+          continue;
+        }
+      }
+      pushText(out, '~~');
+      i += 2;
+      continue;
+    }
     if (!deep && (ch === '*' || ch === '_')) {
       const double = s[i + 1] === ch;
       const marker = double ? ch + ch : ch;
@@ -199,7 +215,50 @@ const FENCE = /^ {0,3}(`{3,}|~{3,})\s*([^\s`]*)[^`]*$/;
 const HEADING = /^ {0,3}(#{1,6})[ \t]+(\S.*)$/;
 const RULE = /^ {0,3}([-*_])(?:\s*\1){2,}\s*$/;
 const ITEM = /^(\s*)([-*+]|\d{1,9}[.)])\s+(.*)$/;
+const TASK = /^\[([ xX])\]\s+(.*)$/;
 const QUOTE = /^ {0,3}>\s?(.*)$/;
+const TABLE_SEP_CELL = /^:?-{1,}:?$/;
+
+function splitTableCells(line) {
+  let s = line.trim();
+  if (s.startsWith('|')) s = s.slice(1);
+  if (s.endsWith('|') && !s.endsWith('\\|')) s = s.slice(0, -1);
+  const cells = [];
+  let cur = '';
+  let inCode = false;
+  for (let i = 0; i < s.length; i++) {
+    const ch = s[i];
+    if (ch === '\\' && i + 1 < s.length && s[i + 1] === '|') {
+      cur += '|';
+      i++;
+      continue;
+    }
+    if (ch === '`') inCode = !inCode;
+    if (ch === '|' && !inCode) {
+      cells.push(cur.trim());
+      cur = '';
+      if (cells.length >= MAX_TABLE_COLS) break;
+      continue;
+    }
+    cur += ch;
+  }
+  if (cells.length < MAX_TABLE_COLS) cells.push(cur.trim());
+  return cells;
+}
+
+function parseTableAlign(line) {
+  if (!line || line.length > MAX_LINE || !line.includes('|')) return null;
+  const cells = splitTableCells(line);
+  if (!cells.length) return null;
+  const align = [];
+  for (const c of cells) {
+    if (!TABLE_SEP_CELL.test(c)) return null;
+    const left = c.startsWith(':');
+    const right = c.endsWith(':');
+    align.push(left && right ? 'center' : right ? 'right' : left ? 'left' : '');
+  }
+  return align;
+}
 
 /** A heading's text without the closing run of # some write after it. */
 function headingText(text) {
@@ -286,8 +345,29 @@ function read(src, depth, budget) {
       i = j - 1;
       continue;
     }
+    if (line.includes('|') && i + 1 < lines.length) {
+      const align = parseTableAlign(lines[i + 1]);
+      if (align) {
+        const headRaw = splitTableCells(line);
+        if (headRaw.length === align.length) {
+          flush();
+          const cols = align.length;
+          const head = headRaw.map((c) => parseInline(c, 0, work));
+          const rows = [];
+          let j = i + 2;
+          for (; j < lines.length && lines[j].length <= MAX_LINE && lines[j].trim() !== '' && lines[j].includes('|'); j++) {
+            const cells = splitTableCells(lines[j]);
+            while (cells.length < cols) cells.push('');
+            rows.push(cells.slice(0, cols).map((c) => parseInline(c, 0, work)));
+          }
+          blocks.push({ t: 'table', align, head, rows });
+          i = j - 1;
+          continue;
+        }
+      }
+    }
     if (/^\s*\|/.test(line)) {
-      // A table is kept as written, in the fixed-width face, so its columns still line up.
+      // Pipe lines without a valid separator row stay in a fixed-width block.
       flush();
       const body = [];
       let j = i;
@@ -307,14 +387,30 @@ function read(src, depth, budget) {
         const m = ITEM.exec(lines[j]);
         if (m) {
           const d = Math.max(0, Math.min(MAX_DEPTH - 1, Math.floor((m[1].replace(/\t/g, '    ').length - base) / 2)));
-          items.push({ d, text: [m[3]] });
+          let bodyText = m[3];
+          let checked = null;
+          if (!ordered) {
+            const tm = TASK.exec(bodyText);
+            if (tm) {
+              checked = tm[1].toLowerCase() === 'x';
+              bodyText = tm[2];
+            }
+          }
+          items.push({ d, checked, text: [bodyText] });
         } else if (lines[j].trim() !== '' && /^\s+/.test(lines[j]) && items.length && !FENCE.test(lines[j])) {
           items[items.length - 1].text.push(lines[j].trim());
         } else {
           break;
         }
       }
-      blocks.push({ t: ordered ? 'ol' : 'ul', items: items.map((it) => ({ d: it.d, c: parseInline(it.text.join('\n'), 0, work) })) });
+      blocks.push({
+        t: ordered ? 'ol' : 'ul',
+        items: items.map((it) => {
+          const node = { d: it.d, c: parseInline(it.text.join('\n'), 0, work) };
+          if (it.checked !== null) node.checked = it.checked;
+          return node;
+        }),
+      });
       i = j - 1;
       continue;
     }

@@ -415,16 +415,68 @@ vim.ui.select = function(items, opts, cb)
   return cb(items[1])
 end
 type_and_send("QUESTION")
-check("question: interactive answer reaches agent", idle() and chat.text():find("SQLite", 1, true) ~= nil, chat.text())
+check("question: interactive spec-compliant Answer reaches agent",
+  idle() and chat.text():find('"kind": "options"', 1, true) ~= nil and chat.text():find("SQLite", 1, true) ~= nil, chat.text())
 type_and_send("PLANCARD")
 check("plan: interactive approval reaches agent", idle() and chat.text():find("approve", 1, true) ~= nil, chat.text())
 vim.cmd("LLeMbasFiles other")
-check("files: attaches @path into prompt",
+check("files: attaches @path from real CLI {path, kind} entries",
   wait(function() return table.concat(vim.api.nvim_buf_get_lines(chat.ibuf, 0, -1, false), ""):find("@other.py", 1, true) ~= nil end))
 vim.api.nvim_buf_set_lines(chat.ibuf, 0, -1, false, {})
+vim.cmd("LLeMbasCommands")
+check("commands: picks and inserts /command into prompt",
+  wait(function() return table.concat(vim.api.nvim_buf_get_lines(chat.ibuf, 0, -1, false), ""):find("/review", 1, true) ~= nil end))
+vim.api.nvim_buf_set_lines(chat.ibuf, 0, -1, false, {})
 vim.cmd("LLeMbasSessions")
-check("sessions: resumes previous session and replays history",
+check("sessions: resumes previous session and replays real CLI historyTurns",
   wait(function() return L._state.session == "ses_prev" and chat.text():find("old reply", 1, true) ~= nil end), chat.text())
+vim.cmd("LLeMbasCompact")
+check("compact: compacts session and prints summary note",
+  wait(function() return chat.text():find("Compacted 1 turn", 1, true) ~= nil end), chat.text())
+
+-- Autocomplete tokens preset, custom instructions & word-by-word acceptance.
+vim.cmd("LLeMbasAutocompleteTokens block")
+check("autocomplete tokens: preset sets scope and token cap",
+  L.config.complete.length == "block" and L.config.complete.max_tokens == 256)
+vim.cmd("LLeMbasAutocompleteInstructions Keep it concise")
+check("autocomplete instructions: sets custom instructions",
+  L.config.complete.instructions == "Keep it concise")
+vim.api.nvim_set_current_win(vim.fn.bufwinid(obuf))
+vim.api.nvim_buf_set_lines(obuf, 0, -1, false, { "def TWO" })
+vim.api.nvim_win_set_cursor(0, { 1, 7 })
+C.request(true)
+wait(function() return ghost(obuf) ~= nil end)
+local c_last = calls("_lembas/complete")
+local req = c_last[#c_last]
+check("autocomplete tuning: max_tokens and instructions context reach _lembas/complete",
+  req and req.max_tokens == 256 and req.context and req.context[1].path == "llembas:autocomplete-instructions"
+  and req.context[1].text:find("Keep it concise", 1, true) ~= nil, vim.inspect(req))
+check("autocomplete accept_word: inserts first word and keeps remaining ghost text",
+  C.accept_word() and vim.api.nvim_buf_get_lines(obuf, 0, 1, false)[1] == "def TWOtail" and ghost(obuf) ~= nil,
+  vim.inspect({ vim.api.nvim_buf_get_lines(obuf, 0, 1, false)[1], ghost(obuf) }))
+C.clear()
+
+-- :LLeMbasFix sends buffer diagnostics in _meta.lembas.editor.diagnostics.
+local d_ns = vim.api.nvim_create_namespace("test-diag")
+vim.diagnostic.set(d_ns, obuf, { { lnum = 0, col = 0, severity = vim.diagnostic.severity.ERROR, message = "broken syntax", source = "lint" } })
+vim.cmd("LLeMbasFix")
+idle()
+all = sent()
+for i = #all, 1, -1 do if all[i].method == "session/prompt" then pr = all[i].params break end end
+check("fix: buffer diagnostics reach agent in _meta.lembas.editor.diagnostics",
+  pr and pr._meta and pr._meta.lembas and pr._meta.lembas.editor and pr._meta.lembas.editor.diagnostics
+  and pr._meta.lembas.editor.diagnostics[1].message == "broken syntax", vim.inspect(pr))
+vim.diagnostic.reset(d_ns, obuf)
+
+-- :LLeMbasGenerate & statusline.
+vim.api.nvim_set_current_win(vim.fn.bufwinid(obuf))
+vim.api.nvim_buf_set_lines(obuf, 0, -1, false, { "x = 1" })
+vim.api.nvim_win_set_cursor(0, { 1, 0 })
+vim.cmd("LLeMbasGenerate write helper")
+check("generate: proposes inline diff hunks at cursor", wait(function() return D.pending(obuf) > 0 end))
+check("statusline: reports pending changes", L.statusline():find("change", 1, true) ~= nil, L.statusline())
+vim.cmd("LLeMbasReject!")
+check("statusline: reports active session mode and model", L.statusline():find("edit", 1, true) ~= nil, L.statusline())
 
 vim.notify = notify
 

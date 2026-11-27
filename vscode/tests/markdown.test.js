@@ -55,7 +55,7 @@ function render(src) {
   page.buildBlocks(doc, parse(src), root, 0);
   return root;
 }
-const ALLOWED = new Set(['#text', 'div', 'p', 'h1', 'h2', 'h3', 'h4', 'h5', 'h6', 'pre', 'code', 'hr', 'blockquote', 'ul', 'ol', 'li', 'strong', 'em', 'span', 'br']);
+const ALLOWED = new Set(['#text', 'div', 'p', 'h1', 'h2', 'h3', 'h4', 'h5', 'h6', 'pre', 'code', 'hr', 'blockquote', 'ul', 'ol', 'li', 'strong', 'em', 'del', 'span', 'br', 'table', 'thead', 'tbody', 'tr', 'th', 'td']);
 
 test('paragraphs, emphasis, code and line breaks', () => {
   assert.equal(render('Hello **bold** and *it* and `x < y`.\nnext').show(), 'div(p("Hello " strong("bold") " and " em("it") " and " code("x < y") "." br() "next"))');
@@ -81,8 +81,39 @@ test('a fenced block is text as written, and one still being written is a block 
   assert.equal(render('~~~\na\n~~~').show(), 'div(pre(code("a")))');
 });
 
-test('a table is kept as written, in a block that scrolls on its own', () => {
-  assert.equal(render('| a | b |\n|---|---|\n| 1 | 2 |').show(), 'div(pre(code("| a | b |\\n|---|---|\\n| 1 | 2 |")))');
+test('a GFM table is rendered as a table inside a scrollable wrapper, with alignment and inline formatting', () => {
+  assert.equal(render('| a | b |\n|---|---|\n| 1 | 2 |').show(), 'div(div(table(thead(tr(th("a") th("b"))) tbody(tr(td("1") td("2"))))))');
+  const aligned = render('| Left | Mid | Right |\n|:---|:---:|---:|\n| **x** | `y` | ~~z~~ |');
+  const ths = aligned.all().filter((n) => n.tag === 'th');
+  assert.deepEqual(ths.map((n) => n.className), ['align-left', 'align-center', 'align-right']);
+  assert.ok(aligned.all().some((n) => n.tag === 'strong' && n.textContent === 'x'));
+  assert.ok(aligned.all().some((n) => n.tag === 'del' && n.textContent === 'z'));
+  // Pipe lines without a separator row fall back to a preformatted block.
+  assert.equal(render('| just | pipes |').show(), 'div(pre(code("| just | pipes |")))');
+});
+
+test('task list checkboxes and strikethrough inline markup', () => {
+  const out = render('- [x] done\n- [ ] todo\n\n~~old~~ text');
+  const lis = out.all().filter((n) => n.tag === 'li');
+  assert.equal(lis.length, 2);
+  assert.ok(lis[0].className.includes('checked'));
+  assert.ok(lis[0].textContent.includes('done'));
+  assert.ok(!lis[1].className.includes('checked'));
+  assert.ok(out.all().some((n) => n.tag === 'del' && n.textContent === 'old'));
+});
+
+test('fenced code block with post handler renders copy and insert toolbar buttons', () => {
+  const posted = [];
+  const root = new Node('div');
+  page.buildBlocks(doc, parse('```python\nprint(1)\n```'), root, 0, (m) => posted.push(m));
+  const buttons = root.all().filter((n) => n.tag === 'button');
+  assert.deepEqual(buttons.map((b) => b.textContent), ['Copy', 'Insert']);
+  buttons[0].listeners.click();
+  buttons[1].listeners.click();
+  assert.deepEqual(posted, [
+    { type: 'copyCode', text: 'print(1)' },
+    { type: 'insertCode', text: 'print(1)' },
+  ]);
 });
 
 test('markup a model writes is text, never elements', () => {
@@ -303,7 +334,7 @@ test('the stylesheet takes every colour from the editor\'s theme', () => {
   assert.ok(!/#[0-9a-fA-F]{3,8}\b/.test(css), 'no hex colours');
   assert.ok(!/\b(rgb|rgba|hsl|hsla)\(/.test(css), 'no colour functions');
   assert.ok(!/url\(|@import/.test(css), 'nothing loaded from a stylesheet');
-  for (const m of css.matchAll(/(?:^|[;{\s])(color|background|background-color|border(?:-[a-z]+)*|outline)\s*:\s*([^;}]+)/g)) {
+  for (const m of css.matchAll(/(?:^|[;{\s])(color|background|background-color|border(?:-(?!collapse|spacing|radius|style|width)[a-z]+)*|outline)\s*:\s*([^;}]+)/g)) {
     const value = m[2].trim();
     if (/^(0|none|transparent|inherit)$/.test(value)) continue;
     const colourless = value.replace(/var\(--vscode-[A-Za-z0-9-]+(?:,\s*(?:transparent|var\(--vscode-[A-Za-z0-9-]+\)))?\)/g, '').replace(/\b(\d+(\.\d+)?(px|em)?|solid|transparent)\b/g, '').trim();

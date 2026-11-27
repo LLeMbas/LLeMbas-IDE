@@ -4,15 +4,34 @@
 (function () {
   'use strict';
 
-  var MARKS = { pending: '…', in_progress: '…', completed: '✓', failed: '✗' };
+  var MARKS = { pending: '…', in_progress: '◐', completed: '✓', failed: '✗' };
   var PLAN_MARKS = { pending: '☐', in_progress: '▸', completed: '✓' };
   var MAX_DEPTH = 8;
+  var FILE_REF_RE = /^([A-Za-z0-9_.\-/]+\.[A-Za-z0-9]{1,10})(?::(\d+)(?:-\d+)?)?$/;
 
   function el(doc, tag, cls, text) {
     var e = doc.createElement(tag);
     if (cls) e.className = cls;
     if (text !== undefined && text !== null) e.textContent = String(text);
     return e;
+  }
+
+  function formatTokens(n) {
+    var v = Number(n) || 0;
+    if (v >= 1000000) return (v / 1000000).toFixed(1) + 'M';
+    if (v >= 1000) return (v / 1000).toFixed(1) + 'k';
+    return String(v);
+  }
+
+  function formatMs(ms) {
+    var v = Number(ms);
+    if (!Number.isFinite(v) || v < 0) return '';
+    if (v < 1000) return Math.round(v) + ' ms';
+    return (v / 1000).toFixed(1) + ' s';
+  }
+
+  function escapeAtPath(p) {
+    return String(p || '').replace(/([ #])/g, '\\$1');
   }
 
   function buildInline(doc, nodes, parent, depth) {
@@ -22,9 +41,14 @@
       if (!n || typeof n !== 'object') continue;
       if (n.t === 'text') parent.appendChild(doc.createTextNode(String(n.v)));
       else if (n.t === 'br') parent.appendChild(doc.createElement('br'));
-      else if (n.t === 'code') parent.appendChild(el(doc, 'code', '', n.v));
-      else if (n.t === 'b' || n.t === 'i') {
-        var e = doc.createElement(n.t === 'b' ? 'strong' : 'em');
+      else if (n.t === 'code') {
+        var raw = String(n.v || '');
+        var isRef = FILE_REF_RE.test(raw.trim());
+        var code = el(doc, 'code', isRef ? 'file-ref' : '', raw);
+        if (isRef) code.setAttribute('title', 'Open ' + raw.trim());
+        parent.appendChild(code);
+      } else if (n.t === 'b' || n.t === 'i' || n.t === 'del') {
+        var e = doc.createElement(n.t === 'b' ? 'strong' : n.t === 'i' ? 'em' : 'del');
         buildInline(doc, n.c, e, depth + 1);
         parent.appendChild(e);
       } else if (n.t === 'a') {
@@ -41,7 +65,7 @@
     }
   }
 
-  function buildBlocks(doc, blocks, parent, depth) {
+  function buildBlocks(doc, blocks, parent, depth, post) {
     if (!Array.isArray(blocks) || depth > MAX_DEPTH) return;
     for (var i = 0; i < blocks.length; i++) {
       var b = blocks[i];
@@ -55,8 +79,64 @@
         e = doc.createElement('h' + level);
         buildInline(doc, b.c, e, 0);
       } else if (b.t === 'pre') {
-        e = doc.createElement('pre');
-        e.appendChild(el(doc, 'code', '', b.v));
+        var pre = doc.createElement('pre');
+        pre.appendChild(el(doc, 'code', '', b.v));
+        if (post) {
+          e = el(doc, 'div', 'code-block');
+          var head = el(doc, 'div', 'code-head');
+          head.appendChild(el(doc, 'span', 'code-lang', b.lang || 'code'));
+          var tools = el(doc, 'div', 'code-tools');
+          (function (codeText) {
+            var copyBtn = button(doc, 'Copy', 'mini', function () {
+              post({ type: 'copyCode', text: codeText });
+              copyBtn.textContent = 'Copied';
+              setTimeout(function () {
+                copyBtn.textContent = 'Copy';
+              }, 1200);
+            });
+            var insBtn = button(doc, 'Insert', 'mini', function () {
+              post({ type: 'insertCode', text: codeText });
+            });
+            tools.appendChild(copyBtn);
+            tools.appendChild(insBtn);
+          })(String(b.v || ''));
+          head.appendChild(tools);
+          e.appendChild(head);
+          e.appendChild(pre);
+        } else {
+          e = pre;
+        }
+      } else if (b.t === 'table') {
+        e = el(doc, 'div', 'table-wrap');
+        var table = doc.createElement('table');
+        var align = Array.isArray(b.align) ? b.align : [];
+        if (Array.isArray(b.head) && b.head.length) {
+          var thead = doc.createElement('thead');
+          var htr = doc.createElement('tr');
+          for (var c = 0; c < b.head.length; c++) {
+            var th = el(doc, 'th', align[c] ? 'align-' + align[c] : '');
+            buildInline(doc, b.head[c], th, 0);
+            htr.appendChild(th);
+          }
+          thead.appendChild(htr);
+          table.appendChild(thead);
+        }
+        var rows = Array.isArray(b.rows) ? b.rows : [];
+        if (rows.length) {
+          var tbody = doc.createElement('tbody');
+          for (var r = 0; r < rows.length; r++) {
+            var tr = doc.createElement('tr');
+            var cells = Array.isArray(rows[r]) ? rows[r] : [];
+            for (var k = 0; k < cells.length; k++) {
+              var td = el(doc, 'td', align[k] ? 'align-' + align[k] : '');
+              buildInline(doc, cells[k], td, 0);
+              tr.appendChild(td);
+            }
+            tbody.appendChild(tr);
+          }
+          table.appendChild(tbody);
+        }
+        e.appendChild(table);
       } else if (b.t === 'plain') {
         // A text too long to be read as Markdown: shown as it was written.
         e = el(doc, 'div', 'plain', b.v);
@@ -64,14 +144,20 @@
         e = doc.createElement('hr');
       } else if (b.t === 'quote') {
         e = doc.createElement('blockquote');
-        buildBlocks(doc, b.c, e, depth + 1);
+        buildBlocks(doc, b.c, e, depth + 1, post);
       } else if (b.t === 'ul' || b.t === 'ol') {
         e = doc.createElement(b.t);
         var items = Array.isArray(b.items) ? b.items : [];
         for (var j = 0; j < items.length; j++) {
-          var d = Math.max(0, Math.min(5, Number(items[j] && items[j].d) || 0));
-          var li = el(doc, 'li', d ? 'depth-' + d : '');
-          buildInline(doc, items[j] && items[j].c, li, 0);
+          var it = items[j] || {};
+          var d = Math.max(0, Math.min(5, Number(it.d) || 0));
+          var liCls = d ? 'depth-' + d : '';
+          if (typeof it.checked === 'boolean') liCls = (liCls ? liCls + ' ' : '') + 'task-item' + (it.checked ? ' checked' : '');
+          var li = el(doc, 'li', liCls);
+          if (typeof it.checked === 'boolean') {
+            li.appendChild(el(doc, 'span', 'task-box', it.checked ? '☑ ' : '☐ '));
+          }
+          buildInline(doc, it.c, li, 0);
           e.appendChild(li);
         }
       } else {
@@ -89,51 +175,89 @@
   }
 
   /** One item of the transcript as an element. `post` sends a message to the extension. */
-  function renderItem(doc, item, post) {
+  function renderItem(doc, item, post, uiState) {
     var root = el(doc, 'div', 'item ' + String(item.kind).replace(/[^a-z]/g, ''));
     root.setAttribute('data-id', String(item.id));
     if (item.kind === 'user') {
-      root.appendChild(el(doc, 'div', 'who', 'You'));
+      var uHead = el(doc, 'div', 'who-row');
+      uHead.appendChild(el(doc, 'span', 'who', 'You'));
+      if (item.label) uHead.appendChild(el(doc, 'span', 'badge', '[' + item.label + ']'));
+      root.appendChild(uHead);
       var body = el(doc, 'div', 'body');
-      if (item.label) body.appendChild(el(doc, 'div', 'label', '[' + item.label + ']'));
       body.appendChild(el(doc, 'div', 'text', item.text));
       root.appendChild(body);
     } else if (item.kind === 'agent') {
       root.appendChild(el(doc, 'div', 'who', 'LLeMbas'));
       var md = el(doc, 'div', 'md');
-      if (Array.isArray(item.ast)) buildBlocks(doc, item.ast, md, 0);
+      if (Array.isArray(item.ast)) buildBlocks(doc, item.ast, md, 0, post);
       else md.textContent = String(item.text || '');
       root.appendChild(md);
     } else if (item.kind === 'thought') {
-      root.appendChild(el(doc, 'div', 'who', 'Thinking'));
-      root.appendChild(el(doc, 'div', 'text', item.text));
+      var details = el(doc, 'details', 'thought-box');
+      if (uiState && uiState.openDetails && uiState.openDetails[item.id]) details.open = true;
+      details.addEventListener('toggle', function () {
+        if (uiState && uiState.openDetails) uiState.openDetails[item.id] = !!details.open;
+      });
+      var txt = String(item.text || '');
+      details.appendChild(el(doc, 'summary', 'thought-summary', 'Thinking · ' + txt.length + ' chars'));
+      details.appendChild(el(doc, 'div', 'text', txt));
+      root.appendChild(details);
     } else if (item.kind === 'note') {
+      if (item.level === 'error' || item.level === 'warn') root.className += ' ' + item.level;
       root.textContent = String(item.text);
     } else if (item.kind === 'tool') {
-      if (item.status === 'failed') root.className += ' failed';
-      root.appendChild(el(doc, 'span', 'mark', MARKS[item.status] || '…'));
-      root.appendChild(el(doc, 'span', 'title', String(item.title) + (item.denied ? ' (not allowed)' : '')));
+      var stCls = item.denied ? 'denied' : item.status === 'failed' ? 'failed' : item.status === 'completed' ? 'completed' : 'running';
+      root.className += ' ' + stCls;
+      var markTxt = item.denied ? '⊘' : MARKS[item.status] || '…';
+      root.appendChild(el(doc, 'span', 'mark', markTxt));
+      var main = el(doc, 'div', 'tool-main');
+      var headRow = el(doc, 'div', 'tool-head');
+      if (item.toolKind) headRow.appendChild(el(doc, 'span', 'tool-kind', item.toolKind));
+      headRow.appendChild(el(doc, 'span', 'title', String(item.title) + (item.denied ? ' (not allowed)' : '')));
+      if (typeof item.ms === 'number') headRow.appendChild(el(doc, 'span', 'tool-ms', formatMs(item.ms)));
+      main.appendChild(headRow);
       var files = Array.isArray(item.files) ? item.files : [];
       if (files.length) {
         var list = el(doc, 'div', 'files');
-        files.slice(0, 20).forEach(function (path, i) {
-          if (i) list.appendChild(doc.createTextNode(', '));
-          var f = el(doc, 'span', 'link', String(path).split(/[\\/]/).pop());
+        files.slice(0, 20).forEach(function (path) {
+          var f = el(doc, 'span', 'file-chip', String(path).split(/[\\/]/).pop());
           f.setAttribute('role', 'link');
           f.setAttribute('tabindex', '0');
           f.setAttribute('title', String(path));
           f.setAttribute('data-file', String(path));
           list.appendChild(f);
         });
-        root.appendChild(list);
+        main.appendChild(list);
       }
+      if (item.output && typeof item.output === 'string' && item.output.trim()) {
+        var outDet = el(doc, 'details', 'tool-output');
+        if (uiState && uiState.openDetails && uiState.openDetails[item.id]) outDet.open = true;
+        outDet.addEventListener('toggle', function () {
+          if (uiState && uiState.openDetails) uiState.openDetails[item.id] = !!outDet.open;
+        });
+        outDet.appendChild(el(doc, 'summary', 'tool-output-summary', item.status === 'failed' ? 'Error output' : 'Output'));
+        outDet.appendChild(el(doc, 'pre', '', item.output));
+        main.appendChild(outDet);
+      }
+      root.appendChild(main);
     } else if (item.kind === 'plan') {
-      root.appendChild(el(doc, 'span', 'mark', item.done >= item.all ? '✓' : '…'));
-      root.appendChild(el(doc, 'span', 'title', 'Plan: ' + Number(item.done) + ' of ' + Number(item.all) + ' tasks done'));
+      var done = Number(item.done) || 0;
+      var all = Number(item.all) || 0;
+      var pHead = el(doc, 'div', 'plan-head');
+      pHead.appendChild(el(doc, 'span', 'mark', all > 0 && done >= all ? '✓' : '▸'));
+      pHead.appendChild(el(doc, 'span', 'title', (item.title ? item.title + ' — ' : 'Plan: ') + done + ' of ' + all + ' done'));
+      root.appendChild(pHead);
+      if (all > 0) {
+        var bar = doc.createElement('progress');
+        bar.className = 'plan-progress';
+        bar.setAttribute('value', String(done));
+        bar.setAttribute('max', String(all));
+        root.appendChild(bar);
+      }
       var entries = Array.isArray(item.entries) ? item.entries : [];
       if (entries.length) {
         var plist = el(doc, 'div', 'plan-entries');
-        entries.slice(0, 20).forEach(function (ent) {
+        entries.slice(0, 24).forEach(function (ent) {
           var row = el(doc, 'div', 'plan-entry ' + String(ent.status || 'pending').replace(/[^a-z_]/g, ''));
           row.appendChild(el(doc, 'span', 'pmark', PLAN_MARKS[ent.status] || '☐'));
           row.appendChild(el(doc, 'span', 'ptext', String(ent.content || '')));
@@ -144,7 +268,9 @@
     } else if (item.kind === 'card') {
       var open = item.state === 'open';
       if (!open) root.className += ' closed';
-      root.appendChild(el(doc, 'div', 'who', open ? 'LLeMbas asks' + (item.tool ? ' (' + item.tool + ')' : '') : 'Asked'));
+      var who = open ? 'LLeMbas asks' + (item.tool ? ' (' + item.tool + ')' : '') : 'Asked';
+      if (item.subagent) who += ' · ' + item.subagent;
+      root.appendChild(el(doc, 'div', 'who', who));
       root.appendChild(el(doc, 'div', 'title', item.title));
       if (open && item.reason) root.appendChild(el(doc, 'div', 'reason', item.reason));
       if (open && item.detail) root.appendChild(el(doc, 'pre', '', item.detail));
@@ -167,7 +293,7 @@
       }
     } else if (item.kind === 'question') {
       var qOpen = item.state === 'open';
-      root.className += ' card' + (qOpen ? '' : ' closed');
+      root.className += ' card info-card' + (qOpen ? '' : ' closed');
       root.appendChild(el(doc, 'div', 'who', qOpen ? 'LLeMbas asks a question' : 'Question'));
       if (item.why) root.appendChild(el(doc, 'div', 'reason', item.why));
       var qs = Array.isArray(item.questions) ? item.questions : [];
@@ -176,14 +302,15 @@
         var inputs = [];
         qs.forEach(function (q, qi) {
           var blk = el(doc, 'div', 'q-block');
-          if (q.header) blk.appendChild(el(doc, 'div', 'q-header', q.header));
+          if (q.header) blk.appendChild(el(doc, 'div', 'q-header', q.header + (q.multiple ? ' (choose any)' : '')));
           blk.appendChild(el(doc, 'div', 'title', q.question));
           var opts = Array.isArray(q.options) ? q.options : [];
           if (opts.length) {
             var optWrap = el(doc, 'div', 'q-options');
             var btns = [];
             opts.forEach(function (o) {
-              var b = button(doc, o.label + (o.description ? ' — ' + o.description : ''), 'second q-opt', function () {
+              var labelTxt = o.label + (o.recommended ? ' ★' : '') + (o.description ? ' — ' + o.description : '');
+              var b = button(doc, labelTxt, 'second q-opt', function () {
                 if (q.multiple) {
                   var idx = chosen[qi].indexOf(o.label);
                   if (idx >= 0) {
@@ -216,9 +343,10 @@
           var answers = qs.map(function (q, qi) {
             var typed = (inputs[qi] && typeof inputs[qi].value === 'string' ? inputs[qi].value.trim() : '');
             var list = chosen[qi].slice();
-            if (typed) list.push(typed);
-            if (!list.length && q.options && q.options[0]) list.push(q.options[0].label);
-            return list;
+            if (typed && !list.length) return { kind: 'custom', text: typed };
+            if (typed && list.length) return { kind: 'custom', text: list.join(', ') + ' — ' + typed };
+            if (list.length) return { kind: 'options', labels: list };
+            return { kind: 'skipped' };
           });
           post({ type: 'answerQuestion', card: item.id, answers: answers });
         }));
@@ -231,11 +359,17 @@
       }
     } else if (item.kind === 'plancard') {
       var pOpen = item.state === 'open';
-      root.className += ' card' + (pOpen ? '' : ' closed');
+      root.className += ' card plan-approval' + (pOpen ? '' : ' closed');
       root.appendChild(el(doc, 'div', 'who', pOpen ? 'Plan ready for approval' : 'Plan'));
       root.appendChild(el(doc, 'div', 'title', item.title || 'Plan'));
-      if (pOpen && item.text) root.appendChild(el(doc, 'pre', '', item.text));
       if (pOpen) {
+        if (Array.isArray(item.ast) && item.ast.length) {
+          var pmd = el(doc, 'div', 'md plan-md');
+          buildBlocks(doc, item.ast, pmd, 0, post);
+          root.appendChild(pmd);
+        } else if (item.text) {
+          root.appendChild(el(doc, 'pre', '', item.text));
+        }
         var fb = el(doc, 'input', 'q-input');
         fb.setAttribute('type', 'text');
         fb.setAttribute('placeholder', 'Optional feedback to revise the plan…');
@@ -251,7 +385,7 @@
           post({ type: 'answerPlan', card: item.id, outcome: 'revise', value: fb.value || '' });
         }));
         pRow.appendChild(button(doc, 'Dismiss', 'second', function () {
-          post({ type: 'answerPlan', card: item.id, outcome: 'dismiss', value: '' });
+          post({ type: 'answerPlan', card: item.id, outcome: 'dismissed', value: '' });
         }));
         root.appendChild(pRow);
       } else {
@@ -287,6 +421,20 @@
   var vscode = acquireVsCodeApi();
   var doc = document;
   var log = doc.getElementById('log');
+  var empty = doc.getElementById('empty');
+  var teamBar = doc.getElementById('team-bar');
+  var connDot = doc.getElementById('conn-dot');
+  var modeDot = doc.getElementById('mode-dot');
+  var sessionTitle = doc.getElementById('session-title');
+  var compactBtn = doc.getElementById('compact');
+  var settingsToggle = doc.getElementById('settings-toggle');
+  var settingsPanel = doc.getElementById('settings-panel');
+  var acTokens = doc.getElementById('ac-tokens');
+  var acTokensVal = doc.getElementById('ac-tokens-val');
+  var acLength = doc.getElementById('ac-length');
+  var acInstructions = doc.getElementById('ac-instructions');
+  var acAuto = doc.getElementById('ac-auto');
+  var chatThinking = doc.getElementById('chat-thinking');
   var prompt = doc.getElementById('prompt');
   var send = doc.getElementById('send');
   var stopBtn = doc.getElementById('stop');
@@ -295,9 +443,12 @@
   var attached = doc.getElementById('attached');
   var attachedLabel = doc.getElementById('attached-label');
   var working = doc.getElementById('working');
+  var workingText = doc.getElementById('working-text');
+  var usageEl = doc.getElementById('usage');
   var popup = doc.getElementById('popup');
-  var state = { busy: false, modes: [], models: [], mode: null, model: null, commands: [], progress: '', canSteer: false };
+  var state = { busy: false, connected: false, modes: [], models: [], mode: null, model: null, commands: [], progress: '', canSteer: false, canCompact: false, title: '', usage: null, team: null };
   var nodes = {};
+  var uiState = { openDetails: {} };
   var popupState = { kind: '', tokenStart: 0, tokenEnd: 0, items: [], index: 0 };
   var fileSearchSeq = 0;
 
@@ -309,20 +460,36 @@
     return log.scrollHeight - log.scrollTop - log.clientHeight < 40;
   }
 
+  function syncEmpty() {
+    if (!empty) return;
+    empty.hidden = Object.keys(nodes).length > 0;
+  }
+
+  function autoRows() {
+    var lines = (prompt.value || '').split('\n').length;
+    prompt.setAttribute('rows', String(Math.max(3, Math.min(8, lines))));
+  }
+
   function upsert(item) {
     var stick = atBottom();
-    var fresh = renderItem(doc, item, post);
+    var fresh = renderItem(doc, item, post, uiState);
     var old = nodes[item.id];
     if (old && old.parentNode === log) log.replaceChild(fresh, old);
     else log.appendChild(fresh);
     nodes[item.id] = fresh;
+    syncEmpty();
     if (stick) log.scrollTop = log.scrollHeight;
   }
 
   function reset(items) {
-    while (log.firstChild) log.removeChild(log.firstChild);
+    var children = Array.prototype.slice.call(log.childNodes);
+    children.forEach(function (ch) {
+      if (ch !== empty) log.removeChild(ch);
+    });
     nodes = {};
+    uiState.openDetails = {};
     (items || []).forEach(upsert);
+    syncEmpty();
     log.scrollTop = log.scrollHeight;
   }
 
@@ -347,14 +514,58 @@
     select.disabled = options.length === 0;
   }
 
+  function renderTeam(tree) {
+    if (!teamBar) return;
+    while (teamBar.firstChild) teamBar.removeChild(teamBar.firstChild);
+    var members = [];
+    function walk(node) {
+      if (!node || typeof node !== 'object') return;
+      if (node.id && node.name) members.push(node);
+      var kids = Array.isArray(node.children) ? node.children : Array.isArray(node.agents) ? node.agents : [];
+      kids.forEach(walk);
+    }
+    if (Array.isArray(tree)) tree.forEach(walk);
+    else walk(tree);
+    if (!members.length) {
+      teamBar.hidden = true;
+      return;
+    }
+    teamBar.appendChild(el(doc, 'span', 'team-label', 'Agents'));
+    members.slice(0, 8).forEach(function (m) {
+      var chip = el(doc, 'span', 'team-chip ' + String(m.state || '').replace(/[^a-z]/g, ''));
+      chip.textContent = String(m.name) + (m.state ? ' · ' + m.state : '');
+      teamBar.appendChild(chip);
+    });
+    teamBar.hidden = false;
+  }
+
   function showState(s) {
     state = s;
     fill(mode, s.modes || [], s.mode, 'Mode');
     fill(model, s.models || [], s.model, 'Model');
     if (stopBtn) stopBtn.hidden = !s.busy;
     send.textContent = s.busy ? (s.canSteer ? 'Steer' : 'Stop') : 'Send';
-    working.hidden = !s.busy;
-    working.textContent = s.progress || 'Working…';
+    if (working) working.hidden = !s.busy;
+    if (workingText) workingText.textContent = s.progress || 'Working…';
+    if (connDot) {
+      connDot.className = 'dot' + (s.busy ? ' is-busy' : s.connected ? ' is-ok' : '');
+      connDot.setAttribute('title', s.busy ? 'Working' : s.connected ? 'Connected' : 'Ready');
+    }
+    if (modeDot) {
+      var mCls = String(s.mode || '').replace(/[^a-z]/g, '');
+      modeDot.className = 'dot mode-dot' + (mCls ? ' mode-' + mCls : '');
+    }
+    if (sessionTitle) sessionTitle.textContent = s.title || 'LLeMbas';
+    if (compactBtn) compactBtn.hidden = !s.canCompact;
+    if (usageEl) {
+      if (s.usage && (s.usage.input || s.usage.output)) {
+        usageEl.textContent = '↑' + formatTokens(s.usage.input) + ' ↓' + formatTokens(s.usage.output);
+        usageEl.hidden = false;
+      } else {
+        usageEl.hidden = true;
+      }
+    }
+    renderTeam(s.team);
     // Mode can be switched live mid-run (Edit <-> Auto, etc.).
     mode.disabled = (s.modes || []).length === 0;
     model.disabled = model.disabled || !!s.busy;
@@ -376,7 +587,10 @@
     popupState.items.forEach(function (it, idx) {
       var row = el(doc, 'div', 'popup-row' + (idx === popupState.index ? ' active' : ''));
       row.setAttribute('role', 'option');
-      row.appendChild(el(doc, 'span', 'popup-label', it.label));
+      var left = el(doc, 'span', 'popup-left');
+      if (it.badge) left.appendChild(el(doc, 'span', 'popup-badge', it.badge));
+      left.appendChild(el(doc, 'span', 'popup-label', it.label));
+      row.appendChild(left);
       if (it.detail) row.appendChild(el(doc, 'span', 'popup-detail', it.detail));
       row.addEventListener('mousedown', function (ev) {
         ev.preventDefault();
@@ -397,6 +611,7 @@
     var pos = (before + inserted).length;
     prompt.setSelectionRange(pos, pos);
     vscode.setState({ draft: prompt.value });
+    autoRows();
     hidePopup();
     prompt.focus();
   }
@@ -410,7 +625,14 @@
       var matches = (state.commands || [])
         .filter(function (c) { return !q || c.name.toLowerCase().indexOf(q) >= 0; })
         .slice(0, 12)
-        .map(function (c) { return { label: '/' + c.name, detail: c.description || '', insert: '/' + c.name }; });
+        .map(function (c) {
+          return {
+            badge: c.kind || 'cmd',
+            label: '/' + c.name + (c.hint ? ' ' + c.hint : ''),
+            detail: c.description || '',
+            insert: '/' + c.name,
+          };
+        });
       popupState = { kind: 'command', tokenStart: 0, tokenEnd: pos, items: matches, index: 0 };
       renderPopup();
       return;
@@ -432,6 +654,7 @@
       if (state.canSteer && text.trim()) {
         post({ type: 'steer', text: text });
         prompt.value = '';
+        autoRows();
         vscode.setState({ draft: '' });
         hidePopup();
         return;
@@ -442,6 +665,7 @@
     if (!text.trim()) return;
     post({ type: 'send', text: text });
     prompt.value = '';
+    autoRows();
     vscode.setState({ draft: '' });
     hidePopup();
   }
@@ -450,6 +674,24 @@
   if (stopBtn) {
     stopBtn.addEventListener('click', function () {
       post({ type: 'stop' });
+    });
+  }
+  if (compactBtn) {
+    compactBtn.addEventListener('click', function () {
+      post({ type: 'compact' });
+    });
+  }
+  if (empty) {
+    empty.addEventListener('click', function (ev) {
+      var btn = ev.target;
+      while (btn && btn !== empty) {
+        var act = btn.getAttribute && btn.getAttribute('data-action');
+        if (act) {
+          post({ type: act });
+          return;
+        }
+        btn = btn.parentNode;
+      }
     });
   }
   prompt.addEventListener('keydown', function (ev) {
@@ -479,6 +721,7 @@
     }
   });
   prompt.addEventListener('input', function () {
+    autoRows();
     vscode.setState({ draft: prompt.value });
     checkPopup();
   });
@@ -517,7 +760,7 @@
       }
       if (t.tagName === 'CODE' && (!t.parentNode || t.parentNode.tagName !== 'PRE')) {
         var raw = (t.textContent || '').trim();
-        var fm = /^([A-Za-z0-9_.\-\/]+\.[A-Za-z0-9]{1,10})(?::(\d+)(?:-\d+)?)?$/.exec(raw);
+        var fm = FILE_REF_RE.exec(raw);
         if (fm) {
           return post({ type: 'openFile', path: fm[1], line: fm[2] ? Number(fm[2]) : undefined, soft: true });
         }
@@ -532,6 +775,94 @@
     if (ev.key === 'Enter') follow(ev.target);
   });
 
+  function formatTokenReadout(n) {
+    var v = Number(n) || 0;
+    return v <= 0 ? 'Default' : v + ' tokens';
+  }
+
+  function applySettingsUi(cfg) {
+    if (!cfg || typeof cfg !== 'object') return;
+    var tokens = Math.max(0, Math.min(4096, Number(cfg.maxTokens) || 0));
+    var len = typeof cfg.length === 'string' ? cfg.length : 'auto';
+    if (acTokens) acTokens.value = String(tokens);
+    if (acTokensVal) acTokensVal.textContent = formatTokenReadout(tokens);
+    if (acLength) acLength.value = len;
+    if (acInstructions && doc.activeElement !== acInstructions) acInstructions.value = String(cfg.instructions || '');
+    if (acAuto) acAuto.checked = cfg.auto !== false;
+    if (chatThinking) chatThinking.checked = !!cfg.showThinking;
+    if (settingsPanel) {
+      var btns = settingsPanel.querySelectorAll('.preset-btn');
+      for (var i = 0; i < btns.length; i++) {
+        var b = btns[i];
+        var match = b.getAttribute('data-length') === len && Number(b.getAttribute('data-tokens')) === tokens;
+        b.className = 'mini preset-btn' + (match ? ' active' : '');
+      }
+    }
+  }
+
+  function pushSettings(patch) {
+    post({ type: 'updateSettings', settings: patch });
+  }
+
+  if (settingsToggle && settingsPanel) {
+    settingsToggle.addEventListener('click', function () {
+      var open = settingsPanel.hidden;
+      settingsPanel.hidden = !open;
+      settingsToggle.setAttribute('aria-expanded', open ? 'true' : 'false');
+    });
+    settingsPanel.addEventListener('click', function (ev) {
+      var btn = ev.target;
+      if (btn && btn.className && String(btn.className).indexOf('preset-btn') >= 0) {
+        var len = btn.getAttribute('data-length') || 'auto';
+        var toks = Number(btn.getAttribute('data-tokens')) || 0;
+        applySettingsUi({
+          maxTokens: toks,
+          length: len,
+          instructions: acInstructions ? acInstructions.value : '',
+          auto: acAuto ? acAuto.checked : true,
+          showThinking: chatThinking ? chatThinking.checked : false,
+        });
+        pushSettings({ maxTokens: toks, length: len });
+      }
+    });
+  }
+  if (acTokens) {
+    acTokens.addEventListener('input', function () {
+      if (acTokensVal) acTokensVal.textContent = formatTokenReadout(acTokens.value);
+    });
+    acTokens.addEventListener('change', function () {
+      pushSettings({ maxTokens: Number(acTokens.value) || 0 });
+    });
+  }
+  if (acLength) {
+    acLength.addEventListener('change', function () {
+      pushSettings({ length: acLength.value });
+    });
+  }
+  var instrTimer = null;
+  if (acInstructions) {
+    acInstructions.addEventListener('input', function () {
+      if (instrTimer) clearTimeout(instrTimer);
+      instrTimer = setTimeout(function () {
+        pushSettings({ instructions: acInstructions.value });
+      }, 300);
+    });
+    acInstructions.addEventListener('change', function () {
+      if (instrTimer) clearTimeout(instrTimer);
+      pushSettings({ instructions: acInstructions.value });
+    });
+  }
+  if (acAuto) {
+    acAuto.addEventListener('change', function () {
+      pushSettings({ auto: !!acAuto.checked });
+    });
+  }
+  if (chatThinking) {
+    chatThinking.addEventListener('change', function () {
+      pushSettings({ showThinking: !!chatThinking.checked });
+    });
+  }
+
   window.addEventListener('message', function (ev) {
     var m = ev.data;
     if (!m || typeof m !== 'object') return;
@@ -539,18 +870,32 @@
       reset(m.items);
       showState(m.state);
       showAttached(m.attached);
+      if (m.settings) applySettingsUi(m.settings);
     } else if (m.type === 'item') upsert(m.item);
     else if (m.type === 'state') showState(m.state);
+    else if (m.type === 'settings') applySettingsUi(m.settings);
     else if (m.type === 'attached') showAttached(m.label);
     else if (m.type === 'focus') prompt.focus();
     else if (m.type === 'insertText' && typeof m.text === 'string') {
       var cur = prompt.value;
       prompt.value = cur && !/\s$/.test(cur) ? cur + ' ' + m.text : cur + m.text;
+      autoRows();
       vscode.setState({ draft: prompt.value });
       prompt.focus();
     } else if (m.type === 'files' && m.seq === fileSearchSeq && popupState.kind === 'file') {
-      popupState.items = (Array.isArray(m.files) ? m.files : []).slice(0, 14).map(function (f) {
-        return { label: f, detail: '', insert: '@' + f };
+      popupState.items = (Array.isArray(m.files) ? m.files : []).slice(0, 14).map(function (entry) {
+        var p = typeof entry === 'string' ? entry : String((entry && entry.path) || '');
+        var isDir = typeof entry === 'object' && entry && entry.kind === 'dir';
+        var slashIdx = p.lastIndexOf('/');
+        var base = slashIdx >= 0 ? p.slice(slashIdx + 1) : p;
+        var dir = slashIdx >= 0 ? p.slice(0, slashIdx) : '';
+        var insertPath = escapeAtPath(p) + (isDir ? '/' : '');
+        return {
+          badge: isDir ? 'dir' : 'file',
+          label: base + (isDir ? '/' : ''),
+          detail: dir,
+          insert: '@' + insertPath,
+        };
       });
       popupState.index = 0;
       renderPopup();
@@ -559,10 +904,13 @@
 
   function showAttached(label) {
     attached.hidden = !label;
-    attachedLabel.textContent = label ? 'With ' + label : '';
+    attachedLabel.textContent = label ? 'Selection: ' + label : '';
   }
 
   var saved = vscode.getState();
-  if (saved && typeof saved.draft === 'string') prompt.value = saved.draft;
+  if (saved && typeof saved.draft === 'string') {
+    prompt.value = saved.draft;
+    autoRows();
+  }
   post({ type: 'ready' });
 })();

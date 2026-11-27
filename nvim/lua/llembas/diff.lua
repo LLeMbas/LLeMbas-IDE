@@ -4,11 +4,14 @@
 local M = {}
 local ns = vim.api.nvim_create_namespace("llembas-diff")
 
-local proposals = {} -- buf -> list of pending hunks { mark, old_count, new, above }
+local proposals = {} -- buf -> list of pending hunks { mark, mark2, hint, old_count, new, above }
+local rewriting = {} -- buf -> active request id
+local req_seq = 0
+local written_by_id = {}
 
 local function count(buf) return #(proposals[buf] or {}) end
 
-local KEYS = { "ga", "gr", "gA", "gR" }
+local KEYS = { "ga", "gr", "gA", "gR", "]h", "[h" }
 local saved = {} -- buf -> the buffer mappings these keys had before
 
 local function unmap(buf)
@@ -20,6 +23,7 @@ end
 local function drop(buf, hunk)
   pcall(vim.api.nvim_buf_del_extmark, buf, ns, hunk.mark)
   if hunk.mark2 then pcall(vim.api.nvim_buf_del_extmark, buf, ns, hunk.mark2) end
+  if hunk.hint then pcall(vim.api.nvim_buf_del_extmark, buf, ns, hunk.hint) end
   local list = proposals[buf] or {}
   for i, h in ipairs(list) do if h == hunk then table.remove(list, i) break end end
   if #list == 0 then
@@ -68,6 +72,40 @@ local function nearest(buf)
   return best or list[#list]
 end
 
+function M.next_hunk()
+  local buf = vim.api.nvim_get_current_buf()
+  local list = proposals[buf] or {}
+  if #list == 0 then return end
+  local rows = {}
+  for _, h in ipairs(list) do
+    local r = row_of(buf, h)
+    if r then rows[#rows + 1] = r end
+  end
+  table.sort(rows)
+  local cur = vim.api.nvim_win_get_cursor(0)[1] - 1
+  for _, r in ipairs(rows) do
+    if r > cur then return pcall(vim.api.nvim_win_set_cursor, 0, { r + 1, 0 }) end
+  end
+  if rows[1] then pcall(vim.api.nvim_win_set_cursor, 0, { rows[1] + 1, 0 }) end
+end
+
+function M.prev_hunk()
+  local buf = vim.api.nvim_get_current_buf()
+  local list = proposals[buf] or {}
+  if #list == 0 then return end
+  local rows = {}
+  for _, h in ipairs(list) do
+    local r = row_of(buf, h)
+    if r then rows[#rows + 1] = r end
+  end
+  table.sort(rows)
+  local cur = vim.api.nvim_win_get_cursor(0)[1] - 1
+  for i = #rows, 1, -1 do
+    if rows[i] < cur then return pcall(vim.api.nvim_win_set_cursor, 0, { rows[i] + 1, 0 }) end
+  end
+  if rows[#rows] then pcall(vim.api.nvim_win_set_cursor, 0, { rows[#rows] + 1, 0 }) end
+end
+
 function M.accept(all)
   local buf = vim.api.nvim_get_current_buf()
   if all then
@@ -95,25 +133,28 @@ function M.pending(buf) return count(buf or vim.api.nvim_get_current_buf()) end
 
 local function virt(lines)
   local out = {}
-  for _, l in ipairs(lines) do out[#out + 1] = { { l == "" and " " or l, "DiffAdd" } } end
+  for _, l in ipairs(lines) do out[#out + 1] = { { l == "" and " " or l, "LLeMbasDiffAdd" } } end
   return out
 end
 
 --- Show `new` (a list of lines) as a proposed replacement of lines `first..last` of `buf`, hunk by hunk.
 --- Returns the number of hunks (0: nothing would change).
 function M.propose(buf, first, last, new)
+  require("llembas.ui").setup_highlights()
   local old = vim.api.nvim_buf_get_lines(buf, first - 1, last, false)
   local hunks = vim.diff(table.concat(old, "\n") .. "\n", table.concat(new, "\n") .. "\n", { result_type = "indices" })
   if #hunks == 0 then return 0 end
   proposals[buf] = proposals[buf] or {}
-  for _, h in ipairs(hunks) do
+  for i, h in ipairs(hunks) do
     local a_start, a_count, b_start, b_count = h[1], h[2], h[3], h[4]
     local lines = vim.list_slice(new, b_start, b_start + b_count - 1)
     local hunk = { old_count = a_count, new = lines }
+    local hint_row
     if a_count > 0 then
       local row = first - 1 + a_start - 1
+      hint_row = row
       hunk.mark = vim.api.nvim_buf_set_extmark(buf, ns, row, 0, {
-        end_row = row + a_count, hl_group = "DiffDelete", hl_eol = true, right_gravity = false })
+        end_row = row + a_count, hl_group = "LLeMbasDiffDelete", hl_eol = true, right_gravity = false })
       if #lines > 0 then
         hunk.mark2 = vim.api.nvim_buf_set_extmark(buf, ns, row + a_count - 1, 0, { virt_lines = virt(lines) })
       end
@@ -123,8 +164,18 @@ function M.propose(buf, first, last, new)
       hunk.above = a_start == 0
       if hunk.above then row = first - 1 end
       row = math.min(math.max(row, 0), math.max(vim.api.nvim_buf_line_count(buf) - 1, 0))
+      hint_row = row
       hunk.mark = vim.api.nvim_buf_set_extmark(buf, ns, row, 0, {
         virt_lines = virt(lines), virt_lines_above = hunk.above, right_gravity = false })
+    end
+    if i == 1 and hint_row then
+      local label = #hunks > 1
+        and ("  ◈ LLeMbas (%d changes): ga accept · gr reject · gA/gR all · ]h/[h jump"):format(#hunks)
+        or "  ◈ LLeMbas: ga accept · gr reject"
+      hunk.hint = vim.api.nvim_buf_set_extmark(buf, ns, hint_row, 0, {
+        virt_text = { { label, "LLeMbasDiffHint" } },
+        virt_text_pos = "eol",
+      })
     end
     table.insert(proposals[buf], hunk)
   end
@@ -140,6 +191,8 @@ function M.propose(buf, first, last, new)
   map("gr", function() M.reject(false) end, "LLeMbas: reject this change")
   map("gA", function() M.accept(true) end, "LLeMbas: accept all changes")
   map("gR", function() M.reject(true) end, "LLeMbas: reject all changes")
+  map("]h", function() M.next_hunk() end, "LLeMbas: next proposed change")
+  map("[h", function() M.prev_hunk() end, "LLeMbas: previous proposed change")
   return #hunks
 end
 
@@ -148,36 +201,63 @@ function M.forget(buf)
   for _, h in ipairs(vim.list_slice(proposals[buf] or {})) do drop(buf, h) end
 end
 
-local written = 0
 --- The agent says how far a rewrite has got.
 function M.delta(params)
-  written = written + #(params.delta or "")
-  vim.api.nvim_echo({ { ("LLeMbas is rewriting… %d characters"):format(written), "Comment" } }, false, {})
+  local id = (params and params.id) or "default"
+  written_by_id[id] = (written_by_id[id] or 0) + #((params and params.delta) or "")
+  vim.api.nvim_echo({ { ("LLeMbas is rewriting… %d characters"):format(written_by_id[id]), "Comment" } }, false, {})
 end
 
---- Have lines `first..last` rewritten as `instruction` says, and show the result as hunks.
-function M.rewrite(buf, first, last, instruction)
+--- Cancel an in-flight rewrite or generation in the current buffer.
+function M.cancel(buf)
+  buf = buf or vim.api.nvim_get_current_buf()
+  local id = rewriting[buf]
+  if not id then return false end
+  rewriting[buf] = nil
+  written_by_id[id] = nil
+  local conn = require("llembas")._state.conn
+  if conn then conn:notify("_lembas/edit/cancel", { id = id }) end
+  vim.api.nvim_echo({ { "" } }, false, {})
+  vim.notify("LLeMbas: cancelled the rewrite", vim.log.levels.INFO)
+  return true
+end
+
+local function run_edit(buf, first, last, instruction, verb)
   local L = require("llembas")
   if count(buf) > 0 then
     return vim.notify("LLeMbas: accept or reject the changes shown first (ga / gr, gA / gR)", vim.log.levels.WARN)
+  end
+  if rewriting[buf] then
+    return vim.notify("LLeMbas: a rewrite of this buffer is already running (:LLeMbasCancelEdit cancels it)", vim.log.levels.WARN)
   end
   local name = vim.api.nvim_buf_get_name(buf)
   local text = vim.api.nvim_buf_get_lines(buf, first - 1, last, false)
   local before = vim.api.nvim_buf_get_lines(buf, math.max(0, first - 41), first - 1, false)
   local after = vim.api.nvim_buf_get_lines(buf, last, last + 40, false)
   local tick = vim.api.nvim_buf_get_changedtick(buf)
-  written = 0
-  vim.api.nvim_echo({ { "LLeMbas is rewriting…", "Comment" } }, false, {})
+  req_seq = req_seq + 1
+  local id = ("e%d"):format(req_seq)
+  rewriting[buf] = id
+  written_by_id[id] = 0
+  vim.api.nvim_echo({ { "LLeMbas is " .. verb .. "…", "Comment" } }, false, {})
   L._connect(function(conn)
-    if not conn then return vim.notify("LLeMbas: the agent did not start", vim.log.levels.ERROR) end
+    if not conn then
+      rewriting[buf] = nil
+      written_by_id[id] = nil
+      return vim.notify("LLeMbas: the agent did not start", vim.log.levels.ERROR)
+    end
+    local body_text = table.concat(text, "\n")
+    if body_text == "" then body_text = " " end
     conn:request("_lembas/edit", {
-      id = ("e%d"):format(tick), cwd = vim.fn.getcwd(), sessionId = L._state.session, path = name,
-      text = table.concat(text, "\n"), before = table.concat(before, "\n"), after = table.concat(after, "\n"),
+      id = id, cwd = vim.fn.getcwd(), sessionId = L._state.session, path = name ~= "" and name or nil,
+      text = body_text, before = table.concat(before, "\n"), after = table.concat(after, "\n"),
       language = vim.bo[buf].filetype, instruction = instruction, model = L.config.model,
     }, function(err, r)
+      if rewriting[buf] == id then rewriting[buf] = nil end
+      written_by_id[id] = nil
       vim.api.nvim_echo({ { "" } }, false, {})
       if err then return vim.notify("LLeMbas: " .. tostring(err.message), vim.log.levels.ERROR) end
-      if not vim.api.nvim_buf_is_valid(buf) then return end
+      if not r or r.cancelled or not vim.api.nvim_buf_is_valid(buf) then return end
       if vim.api.nvim_buf_get_changedtick(buf) ~= tick then
         return vim.notify("LLeMbas: the buffer changed while the rewrite was written; nothing is shown. Ask again.", vim.log.levels.WARN)
       end
@@ -188,6 +268,16 @@ function M.rewrite(buf, first, last, instruction)
       vim.notify(("LLeMbas: %d change%s shown. ga accepts, gr rejects, gA / gR all."):format(n, n == 1 and "" or "s"), vim.log.levels.INFO)
     end)
   end)
+end
+
+--- Have lines `first..last` rewritten as `instruction` says, and show the result as hunks.
+function M.rewrite(buf, first, last, instruction)
+  run_edit(buf, first, last, instruction, "rewriting")
+end
+
+--- Generate code at 1-based `row` as `instruction` says, and show the result as hunks.
+function M.generate(buf, row, instruction)
+  run_edit(buf, row, row, "At this line, " .. instruction, "generating")
 end
 
 --- An approval card that carries diffs (ACP `diff` content): shown in a window of its own while the
@@ -205,11 +295,13 @@ function M.preview(content)
   local back = vim.api.nvim_get_current_win()
   local b = vim.api.nvim_create_buf(false, true)
   vim.bo[b].buftype, vim.bo[b].bufhidden, vim.bo[b].swapfile, vim.bo[b].modeline = "nofile", "wipe", false, false
+  vim.bo[b].undolevels = -1
   vim.api.nvim_buf_set_lines(b, 0, -1, false, out)
   vim.bo[b].filetype, vim.bo[b].modifiable = "diff", false
   vim.cmd("botright " .. math.min(#out + 1, 18) .. "split")
   local w = vim.api.nvim_get_current_win()
   vim.api.nvim_win_set_buf(w, b)
+  vim.wo[w].winbar = " ◈ LLeMbas proposed diff "
   if vim.api.nvim_win_is_valid(back) then vim.api.nvim_set_current_win(back) end
   return function() if vim.api.nvim_win_is_valid(w) then pcall(vim.api.nvim_win_close, w, true) end end
 end

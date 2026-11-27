@@ -4,12 +4,28 @@
 local rpc = require("llembas.rpc")
 local chat = require("llembas.chat")
 local context = require("llembas.context")
+local ui = require("llembas.ui")
 
 local M = {}
 
+local function read_repo_version()
+  local src = debug.getinfo(1, "S").source
+  if type(src) == "string" and src:sub(1, 1) == "@" then
+    local vfile = vim.fn.fnamemodify(src:sub(2), ":p:h:h:h:h") .. "/VERSION"
+    if vim.fn.filereadable(vfile) == 1 then
+      local v = vim.trim(table.concat(vim.fn.readfile(vfile), ""))
+      if v ~= "" then return v end
+    end
+  end
+  return "1.0.0-beta.4"
+end
+
 M.config = {
   cmd = { "lembas", "serve", "--stdio" }, -- the agent
-  width = 64,                             -- the panel's columns
+  position = "right",                     -- "right" | "left" | "bottom" | "float"
+  width = 64,                             -- the panel's columns (right/left)
+  prompt_height = 5,                      -- the prompt window's rows
+  border = "rounded",                     -- border style for floating windows
   mode = nil,                             -- the mode a session starts in (the CLI's own when nil)
   model = nil,                            -- the model a session starts on (the CLI's own when nil)
   show_thoughts = false,                  -- the model's thinking in the transcript
@@ -18,22 +34,76 @@ M.config = {
     auto = true,                          -- suggest as you type (needs an autocomplete model on the server)
     debounce_ms = 250,                    -- how long you must pause before a suggestion is asked for
     model = nil,                          -- a quick switch for this editor only; nil: your saved choice
+    max_tokens = nil,                     -- maximum tokens to predict (nil/0: server default or length preset)
+    length = "auto",                      -- "auto" | "words" | "line" | "block" | "file"
+    instructions = "",                    -- custom instructions sent with autocomplete requests
     accept = "<Tab>",                     -- accepts a shown suggestion; falls through when none is shown
+    accept_word = "<M-Right>",            -- accepts the next word of a shown suggestion
     trigger = "<M-\\>",                   -- asks for a suggestion now
   },
 }
 
-local S = { conn = nil, session = nil, starting = nil, connecting = nil, ready = false, caps = {}, busy = false,
-            modes = {}, mode = nil, model = nil, progress = nil, attached = nil, attached_label = nil, last_buf = nil, said = nil }
+local S = {
+  conn = nil, session = nil, starting = nil, connecting = nil, ready = false, caps = {}, busy = false,
+  modes = {}, mode = nil, model = nil, title = nil, progress = nil, usage = nil, team = nil, commands = {},
+  attached = nil, attached_label = nil, last_buf = nil, said = nil, shown = nil,
+}
 
-local function note(text) chat.newline(); chat.append("> " .. text .. "\n") end
+local function note(text, level)
+  chat.newline()
+  chat.append("> " .. text .. "\n", level == "error" and "LLeMbasError" or level == "warn" and "LLeMbasWarn" or "LLeMbasNote")
+end
+
+local function escape_at_path(p)
+  return (tostring(p or ""):gsub("([ #])", "\\%1"))
+end
+
+local function normalize_file_entry(entry)
+  if type(entry) == "string" then
+    local clean = entry:gsub("/$", "")
+    if clean == "" then return nil end
+    return { path = clean, kind = entry:sub(-1) == "/" and "dir" or "file" }
+  end
+  if type(entry) == "table" and type(entry.path) == "string" and entry.path ~= "" then
+    return { path = entry.path:gsub("/$", ""), kind = entry.kind == "dir" and "dir" or "file" }
+  end
+  return nil
+end
+
+local function extract_text_content(content)
+  local parts = {}
+  for _, c in ipairs(content or {}) do
+    if type(c) == "table" then
+      if c.type == "content" and type(c.content) == "table" and c.content.type == "text" and type(c.content.text) == "string" then
+        parts[#parts + 1] = c.content.text
+      elseif c.type == "text" and type(c.text) == "string" then
+        parts[#parts + 1] = c.text
+      end
+    end
+  end
+  return table.concat(parts, "\n")
+end
 
 local function status()
+  local top = { "◈ LLeMbas" }
+  if S.title and S.title ~= "" then top[#top + 1] = S.title end
+  if S.mode then top[#top + 1] = "[" .. S.mode .. "]" end
+  if S.model then top[#top + 1] = S.model end
+  if S.usage and ((S.usage.input or 0) > 0 or (S.usage.output or 0) > 0) then
+    top[#top + 1] = ("↑%s ↓%s"):format(ui.format_tokens(S.usage.input), ui.format_tokens(S.usage.output))
+  end
+  if S.busy then
+    top[#top + 1] = (S.progress and S.progress ~= "" and ("◐ " .. S.progress) or "◐ working")
+  end
+  chat.header(" " .. table.concat(top, " · "))
+
   local parts = {}
   if S.attached_label then parts[#parts + 1] = "with " .. S.attached_label end
   if S.mode then parts[#parts + 1] = "mode " .. S.mode end
   if S.model then parts[#parts + 1] = S.model end
-  if S.busy then parts[#parts + 1] = (S.progress and S.progress ~= "" and (S.progress .. " (Ctrl-C stops)") or "working (Ctrl-C stops)") end
+  if S.busy then
+    parts[#parts + 1] = (S.progress and S.progress ~= "" and (S.progress .. " (Ctrl-C stops)") or "working (Ctrl-C stops)")
+  end
   chat.status(" " .. table.concat(parts, " | "))
 end
 
@@ -42,37 +112,90 @@ local function reload_files()
   pcall(vim.cmd, "silent! checktime")
 end
 
-local ICON = { pending = "…", in_progress = "…", completed = "✓", failed = "✗" }
+local ICON = { pending = "…", in_progress = "◐", completed = "✓", failed = "✗" }
+local PLAN_ICON = { pending = "☐", in_progress = "▸", completed = "✓" }
 local tools = {}
+local pending_cards = {} -- toolCallId -> { line_id, label }
+
+local function tool_hl(t)
+  if t.denied then return "LLeMbasToolDenied" end
+  if t.status == "completed" then return "LLeMbasToolDone" end
+  if t.status == "failed" then return "LLeMbasToolFail" end
+  return "LLeMbasToolPending"
+end
+
+local function render_tool_line(t)
+  local icon = t.denied and "⊘" or (ICON[t.status] or "…")
+  local title = t.title or "tool"
+  local show_kind = t.kind and t.kind ~= "" and t.kind ~= "other" and not title:lower():match("^" .. vim.pesc(t.kind:lower()) .. "%f[%W]")
+  local tag = show_kind and ("[" .. t.kind .. "] ") or ""
+  local suffix = t.denied and " (not allowed)" or ""
+  local dur = t.ms and (" · " .. ui.format_ms(t.ms)) or ""
+  return ("- %s %s%s%s%s"):format(icon, tag, title, suffix, dur)
+end
 
 local function on_update(u)
   local kind = u.sessionUpdate
   if kind == "agent_message_chunk" then
-    if S.said ~= "agent" then chat.section("LLeMbas"); S.said = "agent" end
+    if S.said ~= "agent" then chat.section("LLeMbas", "LLeMbasAgentHeader"); S.said = "agent" end
     if u.content and u.content.type == "text" then chat.append(u.content.text) end
   elseif kind == "agent_thought_chunk" then
     if M.config.show_thoughts and u.content and u.content.type == "text" then
-      if S.said ~= "thought" then chat.section("Thinking"); S.said = "thought" end
-      chat.append(u.content.text)
+      if S.said ~= "thought" then chat.section("Thinking", "LLeMbasThoughtHeader"); S.said = "thought" end
+      chat.append(u.content.text, "LLeMbasThought")
     end
   elseif kind == "tool_call" or kind == "tool_call_update" then
-    local t = tools[u.toolCallId] or {}
-    tools[u.toolCallId] = t
+    local id = tostring(u.toolCallId or "")
+    local t = tools[id] or { id = id }
+    tools[id] = t
     t.title = u.title or t.title or "tool"
+    t.kind = u.kind or t.kind
     t.status = u.status or t.status or "pending"
-    chat.line("tool:" .. u.toolCallId, ("- %s %s"):format(ICON[t.status] or "…", t.title))
+    if u._meta and u._meta.lembas and u._meta.lembas.denied then t.denied = true end
+    local text_out = extract_text_content(u.content)
+    if text_out ~= "" then t.output = text_out:sub(1, 20000) end
+    chat.line("tool:" .. id, render_tool_line(t), tool_hl(t), t.output)
     S.said = "tool"
     if t.status == "completed" then reload_files() end
   elseif kind == "plan" then
+    local entries = u.entries or {}
     local done, all = 0, 0
-    for _, e in ipairs(u.entries or {}) do
+    local active_task = nil
+    for _, e in ipairs(entries) do
       all = all + 1
-      if e.status == "completed" then done = done + 1 end
+      if e.status == "completed" then done = done + 1
+      elseif e.status == "in_progress" and not active_task then active_task = e.content end
     end
-    if all > 0 then chat.line("plan", ("- plan: %d of %d tasks done"):format(done, all)); S.said = "tool" end
+    local structured = (u._meta and u._meta.lembas and u._meta.lembas.plan) or nil
+    if all > 0 then
+      local title = (structured and structured.title and structured.title ~= "") and (structured.title .. ": ") or "plan: "
+      local bar = ui.progress_bar(done, all, 10)
+      local tail = active_task and (" — " .. active_task) or ""
+      chat.line("plan", ("- %s%s %d of %d tasks done%s"):format(title, bar, done, all, tail), "LLeMbasPlanHeader")
+      for idx, e in ipairs(entries) do
+        if idx > 16 then break end
+        local picon = PLAN_ICON[e.status] or "☐"
+        local phl = e.status == "completed" and "LLeMbasPlanDone" or e.status == "in_progress" and "LLeMbasPlanActive" or "LLeMbasPlanPending"
+        chat.line("plan:item:" .. idx, ("  %s %s"):format(picon, tostring(e.content or "")), phl)
+      end
+      S.said = "tool"
+    end
   elseif kind == "current_mode_update" then
     S.mode = u.currentModeId or S.mode
     status()
+  elseif kind == "available_commands_update" then
+    local list = {}
+    for _, c in ipairs(u.availableCommands or {}) do
+      if type(c) == "table" and type(c.name) == "string" then
+        list[#list + 1] = {
+          name = c.name,
+          description = type(c.description) == "string" and c.description or "",
+          hint = (c.input and type(c.input.hint) == "string") and c.input.hint or "",
+          kind = (c._meta and c._meta.lembas and type(c._meta.lembas.kind) == "string") and c._meta.lembas.kind or "",
+        }
+      end
+    end
+    S.commands = list
   end
 end
 
@@ -80,9 +203,13 @@ local function on_permission(p, reply)
   local call = p.toolCall or {}
   local meta = (p._meta or {}).lembas or {}
   local options = p.options or {}
-  chat.line("ask:" .. tostring(call.toolCallId), "- ? " .. (call.title or meta.tool or "a tool") .. " (waits for your answer)")
+  local call_id = tostring(call.toolCallId or "")
+  local line_id = "ask:" .. call_id
+  local who = meta.subagent and meta.subagent.name and (" [" .. meta.subagent.name .. "]") or ""
+  chat.line(line_id, "- ? " .. (call.title or meta.tool or "a tool") .. who .. " (waits for your answer)", "LLeMbasToolPending")
+  pending_cards[call_id] = { line_id = line_id, title = call.title or meta.tool or "a tool" }
   local preview = require("llembas.diff").preview(call.content)
-  local prompt = "LLeMbas asks: " .. (call.title or meta.tool or "a tool")
+  local prompt = "LLeMbas asks" .. who .. ": " .. (call.title or meta.tool or "a tool")
   if meta.reason then prompt = prompt .. " (" .. meta.reason .. ")" end
   -- The refusals first: the question can open while you are typing, and a digit and Enter meant for
   -- your code must not allow a command. The first choice is always a denial.
@@ -97,65 +224,139 @@ local function on_permission(p, reply)
     prompt = prompt:gsub("[\r\n]+", " "):sub(1, 400),
     format_item = function(o) return o.name or o.optionId end,
   }, function(choice)
+    pending_cards[call_id] = nil
     if preview then preview() end
     if not choice then
-      chat.line("ask:" .. tostring(call.toolCallId), "- ✗ " .. (call.title or "a tool") .. " (not answered: denied)")
+      chat.line(line_id, "- ✗ " .. (call.title or "a tool") .. " (not answered: denied)", "LLeMbasToolFail")
       return reply({ outcome = { outcome = "cancelled" } })
     end
-    chat.line("ask:" .. tostring(call.toolCallId), ("- %s: %s"):format(choice.name or choice.optionId, call.title or "a tool"))
+    local denied = tostring(choice.kind):match("^reject") ~= nil
+    chat.line(line_id, ("- %s: %s"):format(choice.name or choice.optionId, call.title or "a tool"), denied and "LLeMbasToolDenied" or "LLeMbasToolDone")
     reply({ outcome = { outcome = "selected", optionId = choice.optionId } })
   end)
 end
 
 local function on_question(p, reply)
   local qs = p.questions or {}
-  local id = "q:" .. tostring(p.toolCallId or "")
-  chat.line(id, "- ? " .. (p.why or (qs[1] and qs[1].question) or "question") .. " (waits for your answer)")
+  local call_id = tostring(p.toolCallId or "")
+  local id = "q:" .. call_id
+  chat.line(id, "- ? " .. (p.why or (qs[1] and qs[1].question) or "question") .. " (waits for your answer)", "LLeMbasToolPending")
+  pending_cards[call_id] = { line_id = id, title = "question" }
   pcall(vim.cmd, "stopinsert")
   local answers = {}
+  local summaries = {}
+  local function done_all()
+    pending_cards[call_id] = nil
+    local summary = table.concat(summaries, " · ")
+    chat.line(id, "- ✓ answered question" .. (summary ~= "" and (": " .. summary) or ""), "LLeMbasToolDone")
+    return reply({ outcome = "answered", answers = answers })
+  end
+  local function dismiss_all()
+    pending_cards[call_id] = nil
+    chat.line(id, "- ✗ question dismissed", "LLeMbasToolDenied")
+    return reply({ outcome = "dismissed" })
+  end
   local function ask_idx(i)
-    if i > #qs then
-      chat.line(id, "- answered question")
-      return reply({ outcome = "answered", answers = answers })
-    end
+    if i > #qs then return done_all() end
     local q = qs[i]
     local opts = q.options or {}
-    if #opts > 0 then
+    local title_prompt = (q.header and (q.header .. ": ") or "") .. (q.question or "Choose")
+    if #opts > 0 and q.multiple then
+      local picked = {}
+      local function pick_multi()
+        local choices = {}
+        for _, o in ipairs(opts) do
+          choices[#choices + 1] = { label = o.label, description = o.description, recommended = o.recommended, _opt = true }
+        end
+        choices[#choices + 1] = { label = "__done__", _done = true }
+        choices[#choices + 1] = { label = "__custom__", _custom = true }
+        choices[#choices + 1] = { label = "__skip__", _skip = true }
+        vim.ui.select(choices, {
+          prompt = title_prompt .. " (select one or more, then Done)",
+          format_item = function(o)
+            if o._done then
+              local n = #picked
+              return n > 0 and ("Done (" .. n .. " selected)") or "Done (skip)"
+            end
+            if o._custom then return "Type a custom answer…" end
+            if o._skip then return "Skip this question" end
+            local mark = vim.tbl_contains(picked, o.label) and "[✓] " or "[ ] "
+            local star = o.recommended and " ★" or ""
+            return mark .. o.label .. star .. (o.description and o.description ~= "" and (" — " .. o.description) or "")
+          end,
+        }, function(choice)
+          if not choice then return dismiss_all() end
+          if choice._skip then
+            answers[i] = { kind = "skipped" }
+            summaries[#summaries + 1] = "skipped"
+            return ask_idx(i + 1)
+          end
+          if choice._done then
+            if #picked > 0 then
+              answers[i] = { kind = "options", labels = picked }
+              summaries[#summaries + 1] = table.concat(picked, ", ")
+            else
+              answers[i] = { kind = "skipped" }
+            end
+            return ask_idx(i + 1)
+          end
+          if choice._custom then
+            return vim.ui.input({ prompt = (q.question or "Answer") .. ": " }, function(text)
+              if not text or not text:match("%S") then return dismiss_all() end
+              answers[i] = { kind = "custom", text = vim.trim(text) }
+              summaries[#summaries + 1] = vim.trim(text)
+              ask_idx(i + 1)
+            end)
+          end
+          local idx = nil
+          for k, v in ipairs(picked) do if v == choice.label then idx = k break end end
+          if idx then table.remove(picked, idx) else picked[#picked + 1] = choice.label end
+          pick_multi()
+        end)
+      end
+      pick_multi()
+    elseif #opts > 0 then
       local choices = {}
       for _, o in ipairs(opts) do choices[#choices + 1] = o end
       choices[#choices + 1] = { label = "__custom__", _custom = true }
+      choices[#choices + 1] = { label = "__skip__", _skip = true }
       vim.ui.select(choices, {
-        prompt = (q.header and (q.header .. ": ") or "") .. (q.question or "Choose"),
+        prompt = title_prompt,
         format_item = function(o)
           if o._custom then return "Type a custom answer…" end
-          return o.description and o.description ~= "" and (o.label .. " — " .. o.description) or o.label
+          if o._skip then return "Skip this question" end
+          local star = o.recommended and " ★" or ""
+          return o.label .. star .. (o.description and o.description ~= "" and (" — " .. o.description) or "")
         end,
       }, function(choice)
-        if not choice then
-          chat.line(id, "- ✗ question dismissed")
-          return reply({ outcome = "dismissed" })
+        if not choice then return dismiss_all() end
+        if choice._skip then
+          answers[i] = { kind = "skipped" }
+          summaries[#summaries + 1] = "skipped"
+          return ask_idx(i + 1)
         end
         if choice._custom then
           vim.ui.input({ prompt = (q.question or "Answer") .. ": " }, function(text)
-            if not text or not text:match("%S") then
-              chat.line(id, "- ✗ question dismissed")
-              return reply({ outcome = "dismissed" })
-            end
-            answers[i] = { text }
+            if not text or not text:match("%S") then return dismiss_all() end
+            answers[i] = { kind = "custom", text = vim.trim(text) }
+            summaries[#summaries + 1] = vim.trim(text)
             ask_idx(i + 1)
           end)
         else
-          answers[i] = { choice.label }
+          answers[i] = { kind = "options", labels = { choice.label } }
+          summaries[#summaries + 1] = choice.label
           ask_idx(i + 1)
         end
       end)
     else
       vim.ui.input({ prompt = (q.question or "Answer") .. ": " }, function(text)
-        if not text then
-          chat.line(id, "- ✗ question dismissed")
-          return reply({ outcome = "dismissed" })
+        if not text then return dismiss_all() end
+        if not text:match("%S") then
+          answers[i] = { kind = "skipped" }
+        else
+          answers[i] = { kind = "custom", text = vim.trim(text) }
+          summaries[#summaries + 1] = vim.trim(text)
         end
-        answers[i] = { text }
         ask_idx(i + 1)
       end)
     end
@@ -165,10 +366,12 @@ end
 
 local function on_plan(p, reply)
   local title = (p.plan and p.plan.title) or "Plan ready"
-  local id = "plan:" .. tostring(p.toolCallId or "")
-  chat.section("Plan: " .. title)
+  local call_id = tostring(p.toolCallId or "")
+  local id = "plan:" .. call_id
+  chat.section("Plan: " .. title, "LLeMbasPlanHeader")
   if type(p.text) == "string" and p.text ~= "" then chat.append(p.text .. "\n") end
-  chat.line(id, "- ? " .. title .. " (waits for approval)")
+  chat.line(id, "- ? " .. title .. " (waits for approval)", "LLeMbasToolPending")
+  pending_cards[call_id] = { line_id = id, title = title }
   pcall(vim.cmd, "stopinsert")
   local actions = {
     { id = "dismiss", label = "Dismiss" },
@@ -180,25 +383,26 @@ local function on_plan(p, reply)
     prompt = "LLeMbas plan: " .. title,
     format_item = function(a) return a.label end,
   }, function(choice)
+    pending_cards[call_id] = nil
     if not choice or choice.id == "dismiss" then
-      chat.line(id, "- ✗ plan dismissed")
-      return reply({ outcome = "dismiss" })
+      chat.line(id, "- ✗ plan dismissed", "LLeMbasToolDenied")
+      return reply({ outcome = "dismissed" })
     end
     if choice.id == "approve_edit" then
-      chat.line(id, "- ✓ plan approved (edit mode)")
+      chat.line(id, "- ✓ plan approved (edit mode)", "LLeMbasToolDone")
       return reply({ outcome = "approve", mode = "edit" })
     end
     if choice.id == "approve_manual" then
-      chat.line(id, "- ✓ plan approved (manual mode)")
+      chat.line(id, "- ✓ plan approved (manual mode)", "LLeMbasToolDone")
       return reply({ outcome = "approve", mode = "manual" })
     end
     vim.ui.input({ prompt = "Plan revision feedback: " }, function(fb)
       if not fb or not fb:match("%S") then
-        chat.line(id, "- ✗ plan dismissed")
-        return reply({ outcome = "dismiss" })
+        chat.line(id, "- ✗ plan dismissed", "LLeMbasToolDenied")
+        return reply({ outcome = "dismissed" })
       end
-      chat.line(id, "- ↻ plan revision requested")
-      reply({ outcome = "revise", feedback = fb })
+      chat.line(id, "- ↻ plan revision requested", "LLeMbasPlanActive")
+      reply({ outcome = "revise", feedback = vim.trim(fb) })
     end)
   end)
 end
@@ -208,11 +412,13 @@ local function stopped(code, stderr)
   local waiting = S.starting
   local connecting = S.connecting
   S.conn, S.session, S.starting, S.connecting, S.ready, S.busy = nil, nil, nil, nil, false, false
+  S.progress, S.team = nil, nil
+  pending_cards = {}
   for _, cb in ipairs(connecting or {}) do cb(false) end
   if was then
     local last = ""
     for line in (stderr or ""):gmatch("[^\r\n]+") do if line:match("%S") then last = line end end
-    note(("The agent stopped (exit %s)%s"):format(tostring(code), last ~= "" and (": " .. last) or "."))
+    note(("The agent stopped (exit %s)%s"):format(tostring(code), last ~= "" and (": " .. last) or "."), "error")
   end
   for _, cb in ipairs(waiting or {}) do cb(false) end
   status()
@@ -234,13 +440,41 @@ local function connect(cb, quiet)
     notify = function(method, params)
       if method == "session/update" and params.sessionId == S.session then on_update(params.update or {})
       elseif method == "_lembas/edit/delta" then require("llembas.diff").delta(params)
+      elseif method == "_lembas/permission/settled" then
+        local cid = tostring(params.toolCallId or "")
+        local card = pending_cards[cid]
+        if card then
+          pending_cards[cid] = nil
+          chat.line(card.line_id, "- ⊘ " .. card.title .. " (answered elsewhere or expired)", "LLeMbasNote")
+        end
       elseif method == "_lembas/event" and params.sessionId == S.session and params.event then
         local ev = params.event
         if ev.type == "model" and type(ev.ref) == "string" then S.model = ev.ref; status()
         elseif ev.type == "mode" and type(ev.mode) == "string" then S.mode = ev.mode; status()
+        elseif ev.type == "title" and type(ev.title) == "string" then S.title = ev.title; status()
         elseif ev.type == "phase" then
           local pr = ev.progress
           S.progress = (pr and type(pr.phase) == "string") and (pr.phase:gsub("_", " ") .. (pr.detail and (": " .. pr.detail) or "")) or nil
+          status()
+        elseif ev.type == "usage" then
+          local inp = tonumber(ev.input_tokens or ev.input or ev.tokens_in) or 0
+          local outp = tonumber(ev.output_tokens or ev.output or ev.tokens_out) or 0
+          if inp > 0 or outp > 0 then
+            S.usage = { input = ((S.usage and S.usage.input) or 0) + inp, output = ((S.usage and S.usage.output) or 0) + outp }
+            status()
+          end
+        elseif ev.type == "tool_end" and type(ev.id) == "string" and tonumber(ev.ms) then
+          local t = tools[ev.id]
+          if t then
+            t.ms = tonumber(ev.ms)
+            chat.line("tool:" .. ev.id, render_tool_line(t), tool_hl(t), t.output)
+          end
+        elseif ev.type == "notice" and type(ev.message) == "string" and ev.message:match("%S") then
+          note(ev.message, ev.level)
+        elseif ev.type == "compacted" and type(ev.summary) == "string" and ev.summary:match("%S") then
+          note("Context compacted: " .. ev.summary)
+        elseif ev.type == "team" then
+          S.team = ev.tree
           status()
         end
       end
@@ -258,7 +492,7 @@ local function connect(cb, quiet)
     exit = function(code, stderr) if S.conn == me.conn then stopped(code, stderr) end end,
   }, { cwd = vim.fn.getcwd() })
   if not conn then
-    if not quiet then note(("Could not start %s: %s"):format(M.config.cmd[1], err)) end
+    if not quiet then note(("Could not start %s: %s"):format(M.config.cmd[1], err), "error") end
     S.start_error = ("could not start %s: %s"):format(M.config.cmd[1], err)
     return done(false)
   end
@@ -272,7 +506,7 @@ local function connect(cb, quiet)
   }, function(e1, r)
     if S.conn ~= conn then return done(false) end
     if e1 then
-      if not quiet then note("The agent refused to start: " .. tostring(e1.message)) end
+      if not quiet then note("The agent refused to start: " .. tostring(e1.message), "error") end
       S.conn = nil
       conn:stop()
       return done(false)
@@ -304,7 +538,7 @@ local function ensure(cb)
     conn:request("session/new", { cwd = vim.fn.getcwd(), mcpServers = {}, _meta = meta }, function(e2, r)
       if S.conn ~= conn then return finish(false) end
       if e2 then
-        note("No session: " .. tostring(e2.message))
+        note("No session: " .. tostring(e2.message), "error")
         return finish(false)
       end
       S.session = r.sessionId
@@ -320,17 +554,24 @@ end
 
 --- Send `blocks` as a prompt; `shown` is what the transcript says you wrote.
 local function send(blocks, shown, meta)
-  chat.section("You")
+  chat.section("You", "LLeMbasUserHeader")
   chat.append(shown .. "\n")
   S.said = "you"
   S.busy = true
+  S.progress = nil
   status()
   ensure(function(ok)
     if not ok then S.busy = false; status(); return end
     S.conn:request("session/prompt", { sessionId = S.session, prompt = blocks, _meta = meta }, function(err, r)
       S.busy = false
-      if err then note("The turn failed: " .. tostring(err.message))
-      elseif r and r.stopReason and r.stopReason ~= "end_turn" then note("The turn ended: " .. r.stopReason) end
+      S.progress = nil
+      if err then note("The turn failed: " .. tostring(err.message), "error")
+      else
+        local lm = (r and r._meta and r._meta.lembas) or {}
+        if type(lm.message) == "string" and lm.message ~= "" then note(lm.message) end
+        if type(lm.summary) == "string" and lm.summary ~= "" then note("Compacted: " .. lm.summary) end
+        if r and r.stopReason and r.stopReason ~= "end_turn" then note("The turn ended: " .. r.stopReason) end
+      end
       chat.newline()
       reload_files()
       status()
@@ -350,10 +591,10 @@ end
 local function send_typed(text)
   if S.busy then
     if S.conn and S.session and S.caps.steer then
-      chat.section("You (while working)")
+      chat.section("You (while working)", "LLeMbasUserHeader")
       chat.append(text .. "\n")
       S.conn:request("_lembas/steer", { sessionId = S.session, text = text }, function(err)
-        if err then note("Steer failed: " .. tostring(err.message)) end
+        if err then note("Steer failed: " .. tostring(err.message), "error") end
       end)
       return true
     end
@@ -391,11 +632,20 @@ local function label(buf, first, last)
 end
 
 function M.open(focus)
+  ui.setup_highlights()
   local b = vim.api.nvim_get_current_buf()
   if vim.bo[b].buftype == "" then S.last_buf = b end
   chat.on_send = send_typed
   chat.on_stop = M.stop
-  chat.open(M.config.width, focus)
+  chat.on_help = M.help
+  chat.on_files = function() M.files("", false) end
+  chat.on_commands = M.commands
+  chat.open({
+    width = M.config.width,
+    position = M.config.position,
+    prompt_height = M.config.prompt_height,
+    border = M.config.border,
+  }, focus)
   status()
 end
 
@@ -419,7 +669,7 @@ function M.ask(first, last, question)
 end
 
 --- Have lines `first..last` rewritten as `instruction` says. The agent changes the file itself, under
---- its own permissions, so the buffer has to be saved first.
+--- its own permissions, so the buffer has to be saved first when using an older CLI.
 function M.edit(first, last, instruction)
   local buf = vim.api.nvim_get_current_buf()
   if vim.api.nvim_buf_get_name(buf) == "" or vim.bo[buf].buftype ~= "" then
@@ -450,6 +700,27 @@ function M.edit(first, last, instruction)
   send(blocks, ("[rewrite %s]\n%s"):format(label(buf, first, last), instruction))
 end
 
+--- Generate code at the current cursor line using `_lembas/edit`.
+function M.generate(instruction)
+  local buf = vim.api.nvim_get_current_buf()
+  if vim.bo[buf].buftype ~= "" or not vim.bo[buf].modifiable then
+    return vim.notify("LLeMbas: open an editable buffer first", vim.log.levels.WARN)
+  end
+  if not instruction or not instruction:match("%S") then
+    return vim.ui.input({ prompt = "Generate code at cursor: " }, function(text)
+      if text and text:match("%S") then M.generate(text) end
+    end)
+  end
+  if not S.ready then
+    return connect(function(ok) if ok then M.generate(instruction) end end)
+  end
+  if not S.caps.editor then
+    return vim.notify("LLeMbas: this LLeMbas CLI does not support inline generation yet", vim.log.levels.WARN)
+  end
+  local row = vim.api.nvim_win_get_cursor(0)[1]
+  require("llembas.diff").generate(buf, row, instruction)
+end
+
 function M.stop()
   if S.conn and S.session and S.busy then S.conn:notify("session/cancel", { sessionId = S.session }) end
 end
@@ -462,10 +733,23 @@ function M.new(force)
   S.busy = false
   local conn = S.conn
   S.conn, S.session, S.starting, S.connecting, S.ready, S.said = nil, nil, nil, nil, false, nil
+  S.title, S.progress, S.usage, S.team, S.commands = nil, nil, nil, nil, {}
+  S.attached, S.attached_label, S.shown = nil, nil, nil
   tools = {}
+  pending_cards = {}
   if conn then conn:stop() end
   chat.clear()
   M.open()
+end
+
+function M.compact()
+  if S.busy then return vim.notify("LLeMbas is working; wait for the turn to finish", vim.log.levels.WARN) end
+  if not S.session or not S.conn then return vim.notify("LLeMbas: no active session to compact", vim.log.levels.INFO) end
+  S.conn:request("_lembas/session/compact", { sessionId = S.session }, function(err, r)
+    if err then return vim.notify("LLeMbas: " .. tostring(err.message), vim.log.levels.ERROR) end
+    local summary = r and type(r.summary) == "string" and r.summary or ""
+    note(summary ~= "" and ("Session compacted: " .. summary) or "Session compacted.")
+  end)
 end
 
 function M.mode(id)
@@ -488,12 +772,20 @@ end
 function M.files(query, open_directly)
   ensure(function(ok)
     if not ok then return end
-    local function pick_from(list)
-      if not list or #list == 0 then return vim.notify("LLeMbas: no matching files found", vim.log.levels.INFO) end
-      vim.ui.select(list, { prompt = open_directly and "LLeMbas open file" or "LLeMbas attach file to chat" }, function(file)
-        if not file then return end
+    local function pick_from(raw_list)
+      local list = {}
+      for _, item in ipairs(raw_list or {}) do
+        local norm = normalize_file_entry(item)
+        if norm and (not open_directly or norm.kind ~= "dir") then list[#list + 1] = norm end
+      end
+      if #list == 0 then return vim.notify("LLeMbas: no matching files found", vim.log.levels.INFO) end
+      vim.ui.select(list, {
+        prompt = open_directly and "LLeMbas open file" or "LLeMbas attach file to chat",
+        format_item = function(f) return (f.kind == "dir" and "[dir]  " or "[file] ") .. f.path .. (f.kind == "dir" and "/" or "") end,
+      }, function(entry)
+        if not entry then return end
         if open_directly then
-          local full = file:match("^/") and file or (vim.fn.getcwd() .. "/" .. file)
+          local full = entry.path:match("^/") and entry.path or (vim.fn.getcwd() .. "/" .. entry.path)
           local target
           for _, w in ipairs(vim.api.nvim_tabpage_list_wins(0)) do
             if vim.bo[vim.api.nvim_win_get_buf(w)].buftype == "" then target = w break end
@@ -502,7 +794,8 @@ function M.files(query, open_directly)
           pcall(vim.cmd, "edit " .. vim.fn.fnameescape(full))
         else
           M.open(true)
-          chat.insert_prompt("@" .. file .. " ")
+          local ref = escape_at_path(entry.path) .. (entry.kind == "dir" and "/" or "")
+          chat.insert_prompt("@" .. ref .. " ")
         end
       end)
     end
@@ -517,11 +810,53 @@ function M.files(query, open_directly)
       local q = (query or ""):lower()
       for _, f in ipairs(found) do
         if vim.fn.isdirectory(f) == 0 and (q == "" or f:lower():find(q, 1, true)) then
-          out[#out + 1] = f
+          out[#out + 1] = { path = f, kind = "file" }
           if #out >= 50 then break end
         end
       end
       pick_from(out)
+    end
+  end)
+end
+
+--- Pick a session slash command (`/compact`, `/review`, skills, etc.) and insert it into the prompt.
+function M.commands()
+  ensure(function(ok)
+    if not ok then return end
+    local function pick_cmd(list)
+      if not list or #list == 0 then return vim.notify("LLeMbas: no slash commands available", vim.log.levels.INFO) end
+      vim.ui.select(list, {
+        prompt = "LLeMbas command",
+        format_item = function(c)
+          local tag = (c.kind and c.kind ~= "") and ("[" .. c.kind .. "] ") or ""
+          local desc = (c.description and c.description ~= "") and (" — " .. c.description) or ""
+          return tag .. "/" .. c.name .. desc
+        end,
+      }, function(chosen)
+        if not chosen then return end
+        M.open(true)
+        chat.insert_prompt("/" .. chosen.name .. " ")
+      end)
+    end
+    if #S.commands > 0 then return pick_cmd(S.commands) end
+    if S.caps.commands then
+      S.conn:request("_lembas/commands", { sessionId = S.session }, function(err, r)
+        if err then return vim.notify("LLeMbas: " .. tostring(err.message), vim.log.levels.ERROR) end
+        local out = {}
+        for _, c in ipairs((r and r.commands) or {}) do
+          if type(c) == "table" and type(c.name) == "string" then
+            out[#out + 1] = {
+              name = c.name,
+              description = type(c.description) == "string" and c.description or "",
+              kind = (c._meta and c._meta.lembas and type(c._meta.lembas.kind) == "string") and c._meta.lembas.kind or (c.source or ""),
+            }
+          end
+        end
+        S.commands = out
+        pick_cmd(out)
+      end)
+    else
+      vim.notify("LLeMbas: this CLI does not list slash commands", vim.log.levels.INFO)
     end
   end)
 end
@@ -543,24 +878,53 @@ function M.sessions()
         S.conn:request("_lembas/sessions/resume", { sessionId = chosen.id }, function(e2, res)
           if e2 then return vim.notify("LLeMbas: " .. tostring(e2.message), vim.log.levels.ERROR) end
           S.session = res.sessionId
+          S.title = type(res.title) == "string" and res.title or chosen.title
           S.modes = (res.modes and res.modes.availableModes) or S.modes
           local lm = (res._meta or {}).lembas or {}
           S.mode = (res.modes and res.modes.currentModeId) or lm.mode or S.mode
           S.model = lm.model or S.model
+          S.progress, S.usage, S.team = nil, nil, nil
           tools = {}
+          pending_cards = {}
           chat.clear()
           M.open(false)
           for _, turn in ipairs(res.turns or {}) do
-            if type(turn.user) == "string" and turn.user ~= "" then
-              chat.section("You")
-              chat.append(turn.user .. "\n")
-            end
-            for _, t in ipairs(turn.tools or {}) do
-              chat.line("hist:" .. tostring(t.id or ""), ("- %s %s"):format(t.isError and "✗" or "✓", t.title or t.name or "tool"))
-            end
-            if type(turn.assistant) == "string" and turn.assistant ~= "" then
-              chat.section("LLeMbas")
-              chat.append(turn.assistant .. "\n")
+            if type(turn) == "table" then
+              if turn.role == "user" then
+                local u_text = type(turn.text) == "string" and turn.text or ""
+                if u_text ~= "" then
+                  chat.section(turn.machine and "Harness" or "You", "LLeMbasUserHeader")
+                  chat.append(u_text .. "\n")
+                end
+              elseif turn.role == "assistant" then
+                if M.config.show_thoughts and type(turn.reasoning) == "string" and turn.reasoning ~= "" then
+                  chat.section("Thinking", "LLeMbasThoughtHeader")
+                  chat.append(turn.reasoning .. "\n", "LLeMbasThought")
+                end
+                for _, t in ipairs(turn.tools or {}) do
+                  local tid = tostring(t.id or ("h" .. tostring(#tools + 1)))
+                  local entry = { id = tid, title = t.title or t.name or "tool", status = t.isError and "failed" or "completed", output = type(t.output) == "string" and t.output or nil }
+                  tools[tid] = entry
+                  chat.line("hist:" .. tid, render_tool_line(entry), tool_hl(entry), entry.output)
+                end
+                if type(turn.text) == "string" and turn.text ~= "" then
+                  chat.section("LLeMbas", "LLeMbasAgentHeader")
+                  chat.append(turn.text .. "\n")
+                end
+              else
+                -- Legacy combined shape fallback
+                if type(turn.user) == "string" and turn.user ~= "" then
+                  chat.section("You", "LLeMbasUserHeader")
+                  chat.append(turn.user .. "\n")
+                end
+                for _, t in ipairs(turn.tools or {}) do
+                  chat.line("hist:" .. tostring(t.id or ""), ("- %s %s"):format(t.isError and "✗" or "✓", t.title or t.name or "tool"), t.isError and "LLeMbasToolFail" or "LLeMbasToolDone")
+                end
+                if type(turn.assistant) == "string" and turn.assistant ~= "" then
+                  chat.section("LLeMbas", "LLeMbasAgentHeader")
+                  chat.append(turn.assistant .. "\n")
+                end
+              end
             end
           end
           S.said = nil
@@ -582,20 +946,64 @@ function M.fix()
   if not buf then return vim.notify("LLeMbas: open a file first", vim.log.levels.WARN) end
   local diags = vim.diagnostic.get(buf)
   if #diags == 0 then return vim.notify("LLeMbas: no diagnostics reported in this buffer", vim.log.levels.INFO) end
+  S.last_buf = buf
+  local editor = context.editor(buf)
+  local blocks = { context.file(buf) }
+  local dtext = context.diagnostics(buf)
+  if dtext then blocks[#blocks + 1] = { type = "text", text = dtext } end
+  S.attached = { blocks = blocks, editor = editor }
+  S.attached_label = vim.fn.fnamemodify(vim.api.nvim_buf_get_name(buf), ":.") .. " (" .. #diags .. " diagnostics)"
   M.open(false)
   send_typed("Fix the reported diagnostics in this file.")
 end
 
-function M.model(name)
-  if not name or name == "" then return vim.notify("LLeMbas: model " .. (S.model or "not known yet"), vim.log.levels.INFO) end
-  ensure(function(ok)
+function M.toggle_thoughts()
+  M.config.show_thoughts = not M.config.show_thoughts
+  vim.notify("LLeMbas: show thinking is " .. (M.config.show_thoughts and "on" or "off"), vim.log.levels.INFO)
+end
+
+local function settings(set, cb)
+  connect(function(ok)
     if not ok then return end
-    S.conn:request("_lembas/configure", { sessionId = S.session, model = name }, function(err, r)
+    if not S.caps.editor then return vim.notify("LLeMbas: this LLeMbas CLI has no editor settings yet", vim.log.levels.WARN) end
+    S.conn:request("_lembas/editor/settings", set and { set = set } or vim.empty_dict(), function(err, r)
       if err then return vim.notify("LLeMbas: " .. tostring(err.message), vim.log.levels.ERROR) end
-      S.model = (r and r.model) or name
-      status()
+      cb(r or {})
     end)
   end)
+end
+
+local function pick(which, cb)
+  connect(function(ok)
+    if not ok then return end
+    if not S.caps.editor then return vim.notify("LLeMbas: this LLeMbas CLI does not list models yet", vim.log.levels.WARN) end
+    S.conn:request("_lembas/models", vim.empty_dict(), function(err, r)
+      if err then return vim.notify("LLeMbas: " .. tostring(err.message), vim.log.levels.ERROR) end
+      local items = {}
+      for _, m in ipairs((r or {}).models or {}) do
+        if vim.tbl_contains(m["for"] or { "main" }, which) then items[#items + 1] = m end
+      end
+      vim.ui.select(items, { prompt = "LLeMbas " .. which .. " model",
+        format_item = function(m) return m.name and m.name ~= m.id and (m.name .. "  (" .. m.id .. ")") or m.id end },
+        function(m) if m then cb(m.id) end end)
+    end)
+  end)
+end
+
+function M.model(name)
+  local function set(id)
+    ensure(function(ok)
+      if not ok then return end
+      S.conn:request("_lembas/configure", { sessionId = S.session, model = id }, function(err, r)
+        if err then return vim.notify("LLeMbas: " .. tostring(err.message), vim.log.levels.ERROR) end
+        S.model = (r and r.model) or id
+        status()
+      end)
+    end)
+  end
+  if name and name ~= "" then return set(name) end
+  if S.ready and S.caps.editor then return pick("main", set) end
+  vim.notify("LLeMbas: model " .. (S.model or "not known yet"), vim.log.levels.INFO)
 end
 
 --- The agent shows a file (the `show` tool). The agent runs on this machine, so the file is opened
@@ -617,9 +1025,10 @@ function M._show(p, reply)
     vim.bo[b].swapfile = false
     vim.bo[b].modeline = false
     vim.api.nvim_buf_set_lines(b, 0, -1, false, vim.split(p.text, "\n", { plain = true }))
+    if type(p.language) == "string" and p.language ~= "" then pcall(function() vim.bo[b].filetype = p.language end) end
     vim.bo[b].modifiable = false
     if target then vim.api.nvim_win_set_buf(target, b) end
-    chat.line("show:" .. tostring(p.toolCallId), "- shown: " .. tostring(p.path or "text"))
+    chat.line("show:" .. tostring(p.toolCallId), "- shown: " .. tostring(p.path or "text"), "LLeMbasNote")
     S.said = "tool"
     return reply({ shown = true })
   end
@@ -635,9 +1044,9 @@ function M._show(p, reply)
         if tonumber(p.line) then pcall(vim.api.nvim_win_set_cursor, 0, { tonumber(p.line), 0 }) end
       end)
     end
-    chat.line("show:" .. tostring(p.toolCallId), "- shown: " .. rel)
+    chat.line("show:" .. tostring(p.toolCallId), "- shown: " .. rel, "LLeMbasNote")
   else
-    chat.line("show:" .. tostring(p.toolCallId), ("- shown: %s (%s) — :LLeMbasOpen opens it"):format(rel, tostring(p.kind or "file")))
+    chat.line("show:" .. tostring(p.toolCallId), ("- shown: %s (%s) — :LLeMbasOpen opens it"):format(rel, tostring(p.kind or "file")), "LLeMbasNote")
   end
   S.said = "tool"
   reply({ shown = true })
@@ -657,33 +1066,6 @@ function M.open_shown()
     return vim.notify("LLeMbas: not opened, since a file of that kind may run: " .. S.shown, vim.log.levels.WARN)
   end
   vim.ui.open(S.shown)
-end
-
-local function settings(set, cb)
-  connect(function(ok)
-    if not ok then return end
-    if not S.caps.editor then return vim.notify("LLeMbas: this LLeMbas CLI has no editor settings yet", vim.log.levels.WARN) end
-    S.conn:request("_lembas/editor/settings", set and { set = set } or vim.empty_dict(), function(err, r)
-      if err then return vim.notify("LLeMbas: " .. tostring(err.message), vim.log.levels.ERROR) end
-      cb(r or {})
-    end)
-  end)
-end
-
-local function pick(which, cb)
-  connect(function(ok)
-    if not ok then return end
-    S.conn:request("_lembas/models", vim.empty_dict(), function(err, r)
-      if err then return vim.notify("LLeMbas: " .. tostring(err.message), vim.log.levels.ERROR) end
-      local items = {}
-      for _, m in ipairs((r or {}).models or {}) do
-        if vim.tbl_contains(m["for"] or { "main" }, which) then items[#items + 1] = m end
-      end
-      vim.ui.select(items, { prompt = "LLeMbas " .. which .. " model",
-        format_item = function(m) return m.name and m.name ~= m.id and (m.name .. "  (" .. m.id .. ")") or m.id end },
-        function(m) if m then cb(m.id) end end)
-    end)
-  end)
 end
 
 local function said(r)
@@ -716,13 +1098,153 @@ function M.main_model(name)
   pick("main", set)
 end
 
+--- Configure autocomplete max tokens & length scope preset interactively or by argument.
+function M.autocomplete_tokens(arg)
+  local complete = require("llembas.complete")
+  local presets = {
+    { id = "auto", tokens = 0, label = "Server default (auto)" },
+    { id = "words", tokens = 24, label = "Few words — ~24 tokens (current expression)" },
+    { id = "line", tokens = 64, label = "Single line — ~64 tokens (finish current line)" },
+    { id = "block", tokens = 256, label = "Function / block — ~256 tokens" },
+    { id = "file", tokens = 2048, label = "Large / full file — ~2048 tokens" },
+    { id = "custom", tokens = nil, label = "Custom max tokens number…" },
+  }
+  local function apply(length, tokens)
+    if length then M.config.complete.length = length end
+    M.config.complete.max_tokens = (tokens and tokens > 0) and math.min(4096, math.floor(tokens)) or nil
+    complete.reset()
+    vim.notify(("LLeMbas: autocomplete scope=%s, max_tokens=%s"):format(
+      M.config.complete.length or "auto",
+      M.config.complete.max_tokens and tostring(M.config.complete.max_tokens) or "default"), vim.log.levels.INFO)
+  end
+  if arg and arg ~= "" then
+    local n = tonumber(arg)
+    if n then return apply(nil, n) end
+    for _, p in ipairs(presets) do
+      if p.id == arg and p.id ~= "custom" then return apply(p.id, p.tokens) end
+    end
+    return vim.notify("LLeMbas: use a number (0..4096) or auto|words|line|block|file", vim.log.levels.WARN)
+  end
+  vim.ui.select(presets, {
+    prompt = ("LLeMbas autocomplete length (now: %s, %s tokens)"):format(
+      M.config.complete.length or "auto", M.config.complete.max_tokens or "default"),
+    format_item = function(p) return p.label end,
+  }, function(choice)
+    if not choice then return end
+    if choice.id == "custom" then
+      return vim.ui.input({ prompt = "Max tokens (0 for server default, up to 4096): " }, function(val)
+        local n = tonumber(val or "")
+        if n then apply(nil, n) end
+      end)
+    end
+    apply(choice.id, choice.tokens)
+  end)
+end
+
+--- Configure custom autocomplete instructions (or "-" to clear).
+function M.autocomplete_instructions(arg)
+  local function apply(text)
+    M.config.complete.instructions = (text == "-" or not text) and "" or vim.trim(text)
+    require("llembas.complete").reset()
+    vim.notify("LLeMbas: autocomplete instructions " .. (M.config.complete.instructions ~= "" and ("set: " .. M.config.complete.instructions) or "cleared"), vim.log.levels.INFO)
+  end
+  if arg and arg ~= "" then return apply(arg) end
+  vim.ui.input({ prompt = "Autocomplete instructions (empty or '-' to clear): ", default = M.config.complete.instructions or "" }, function(val)
+    if val ~= nil then apply(val) end
+  end)
+end
+
+--- Floating status overview card (`:LLeMbasStatus`).
+function M.status_popup()
+  ui.setup_highlights()
+  local c = M.config.complete
+  local caps = vim.tbl_keys(S.caps)
+  table.sort(caps)
+  local lines = {
+    "◈ LLeMbas " .. M.version,
+    "──────────────────────────────────────────",
+    "Agent:         " .. (S.ready and "connected" or S.conn and "starting…" or "idle"),
+    "Session:       " .. (S.session or "(none)"),
+    "Title:         " .. (S.title or "—"),
+    "Mode:          " .. (S.mode or "—"),
+    "Model:         " .. (S.model or "—"),
+    "Busy:          " .. (S.busy and (S.progress or "working") or "no"),
+    "Usage:         " .. (S.usage and ("↑" .. ui.format_tokens(S.usage.input) .. " ↓" .. ui.format_tokens(S.usage.output)) or "—"),
+    "",
+    "Autocomplete:  " .. (c.auto and "on" or "off") .. "  (debounce " .. tostring(c.debounce_ms) .. "ms)",
+    "Scope / Cap:   " .. (c.length or "auto") .. " · " .. (c.max_tokens and (tostring(c.max_tokens) .. " tokens") or "server default"),
+    "Instructions:  " .. ((c.instructions and c.instructions ~= "") and c.instructions or "(none)"),
+    "Window model:  " .. (c.model or "(account default)"),
+    "",
+    "Capabilities:  " .. (#caps > 0 and table.concat(caps, ", ") or "(not connected yet)"),
+  }
+  ui.float("LLeMbas Status", lines, { border = M.config.border })
+end
+
+--- Floating keymaps & commands card (`:LLeMbasHelp`).
+function M.help()
+  ui.setup_highlights()
+  local lines = {
+    "◈ LLeMbas IDE — Commands & Keys",
+    "───────────────────────────────────────────────",
+    "Panel:",
+    "  :LLeMbas                 Toggle chat panel",
+    "  :LLeMbasNew[!]           New session (! kills hung turn)",
+    "  :LLeMbasSessions         Resume a previous session",
+    "  :LLeMbasCompact          Compact session context",
+    "  :LLeMbasStop             Stop running turn",
+    "  :LLeMbasStatus           Show agent & autocomplete status",
+    "",
+    "Coding:",
+    "  :[range]LLeMbasAsk       Ask about selection (or attach)",
+    "  :[range]LLeMbasExplain   Explain selected lines",
+    "  :[range]LLeMbasEdit      Rewrite selection as inline diff",
+    "  :LLeMbasGenerate         Generate code at cursor",
+    "  :LLeMbasFix              Fix buffer diagnostics",
+    "  :LLeMbasFiles[!]         Attach @file (! opens directly)",
+    "  :LLeMbasCommands         Pick a /command or skill",
+    "",
+    "Inline Diff Proposal Keys:",
+    "  ga / gr                  Accept / reject hunk under cursor",
+    "  gA / gR                  Accept / reject all hunks",
+    "  ]h / [h                  Next / previous proposed hunk",
+    "",
+    "Autocomplete:",
+    "  <Tab> / <M-Right>        Accept suggestion / accept word",
+    "  <M-\\>                    Trigger suggestion manually",
+    "  :LLeMbasAutocompleteTokens [N|words|line|block|file|auto]",
+    "  :LLeMbasAutocompleteInstructions [text|-]",
+    "",
+    "Transcript Keys: <CR>/gf open file · K tool output · y yank code · i prompt · q close",
+  }
+  ui.float("LLeMbas Help", lines, { border = M.config.border })
+end
+
+--- Compact statusline component for lualine / statusline integration.
+function M.statusline()
+  local pending = require("llembas.diff").pending()
+  if pending > 0 then
+    return ("◈ LLeMbas: %d change%s (ga/gr)"):format(pending, pending == 1 and "" or "s")
+  end
+  if S.busy then
+    return "◈ LLeMbas ◐ " .. (S.progress or "working")
+  end
+  if S.session then
+    local short = S.model and (S.model:match("[^/]+$") or S.model) or ""
+    return "◈ LLeMbas" .. (S.mode and (" [" .. S.mode .. "]") or "") .. (short ~= "" and (" " .. short) or "")
+  end
+  return ""
+end
+
 function M.mode_ids()
   return vim.tbl_map(function(m) return m.id end, S.modes)
 end
 
 function M.setup(opts)
   M.config = vim.tbl_deep_extend("force", M.config, opts or {})
-  if type(M.config.cmd) == "string" then M.config.cmd = { M.config.cmd, "serve", "--stdio" } end  require("llembas.complete").setup()
+  if type(M.config.cmd) == "string" then M.config.cmd = { M.config.cmd, "serve", "--stdio" } end
+  ui.setup_highlights()
+  require("llembas.complete").setup()
 end
 
 --- For the plugin's other parts: the connection once the agent has started (`cb(conn | nil)`).
@@ -730,12 +1252,12 @@ function M._connect(cb, quiet)
   connect(function(ok) cb(ok and S.conn or nil) end, quiet)
 end
 
-function M._note(text)
+function M._note(text, level)
   M.open(false)
-  note(text)
+  note(text, level)
 end
 
-M.version = "1.0.0-beta.3"
+M.version = read_repo_version()
 M._state = S -- for the tests
 
 vim.api.nvim_create_autocmd("VimLeavePre", {

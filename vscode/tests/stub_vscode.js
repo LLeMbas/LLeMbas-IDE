@@ -233,6 +233,7 @@ function make(pkg) {
     ViewColumn: { Beside: -2 },
     InlineCompletionTriggerKind: { Invoke: 0, Automatic: 1 },
     DiagnosticSeverity: { Error: 0, Warning: 1, Information: 2, Hint: 3 },
+    ConfigurationTarget: { Global: 1, Workspace: 2, WorkspaceFolder: 3 },
     workspace: {
       workspaceFolders: undefined,
       textDocuments: [],
@@ -241,6 +242,11 @@ function make(pkg) {
           const full = `${section}.${key}`;
           if (!(full in defaults)) throw new Error('a setting that is not declared: ' + full);
           return full in state.config ? state.config[full] : defaults[full];
+        },
+        update: async (key, value) => {
+          const full = `${section}.${key}`;
+          if (!(full in defaults)) throw new Error('a setting that is not declared: ' + full);
+          state.config[full] = value;
         },
       }),
       registerTextDocumentContentProvider: (scheme, provider) => {
@@ -351,6 +357,11 @@ function make(pkg) {
       getDiagnostics: (uri) => state.diagnostics.get(uri.toString()) || [],
     },
     env: {
+      clipboard: {
+        writeText: async (text) => {
+          state.copied = text;
+        },
+      },
       openExternal: async (uri) => {
         state.external.push(uri.toString());
         return true;

@@ -34,6 +34,7 @@
       { "command": "llembas.open", "title": "Open the Chat", "category": "LLeMbas" },
       { "command": "llembas.newSession", "title": "New Session", "category": "LLeMbas" },
       { "command": "llembas.resumeSession", "title": "Resume a Previous Session", "category": "LLeMbas" },
+      { "command": "llembas.compact", "title": "Compact Session Context", "category": "LLeMbas" },
       { "command": "llembas.stop", "title": "Stop the Running Turn", "category": "LLeMbas" },
       { "command": "llembas.ask", "title": "Ask About the Selection", "category": "LLeMbas" },
       { "command": "llembas.explain", "title": "Explain the Selection", "category": "LLeMbas" },
@@ -41,6 +42,7 @@
       { "command": "llembas.generate", "title": "Generate Code at Cursor", "category": "LLeMbas" },
       { "command": "llembas.rewrite", "title": "Rewrite the Selection", "category": "LLeMbas" },
       { "command": "llembas.complete", "title": "Suggest a Completion Here", "category": "LLeMbas" },
+      { "command": "llembas.toggleAutocomplete", "title": "Toggle Autocomplete as You Type", "category": "LLeMbas" },
       { "command": "llembas.openFile", "title": "Open File from Project Index", "category": "LLeMbas" },
       { "command": "llembas.addFile", "title": "Add File to Chat", "category": "LLeMbas" },
       { "command": "llembas.acceptChange", "title": "Accept the Proposed Change at the Cursor", "category": "LLeMbas" },
@@ -127,8 +129,26 @@
           "type": "number",
           "default": 0,
           "minimum": 0,
-          "maximum": 512,
-          "description": "The longest completion to ask for, in tokens. 0: the server's own number."
+          "maximum": 4096,
+          "description": "Maximum tokens to predict for autocomplete (0: server default or preset; e.g. 24 for a few words, 256 for a block, 2048 for a large file section)."
+        },
+        "llembas.complete.length": {
+          "type": "string",
+          "default": "auto",
+          "enum": ["auto", "words", "line", "block", "file"],
+          "enumDescriptions": [
+            "Use the server's default prediction length",
+            "Few words — finish the current expression or identifier (~24 tokens)",
+            "Single line — finish the current line (~64 tokens)",
+            "Function / block — complete a block or function (~256 tokens)",
+            "Large / file — predict a large multi-block or full-file continuation (~2048 tokens)"
+          ],
+          "description": "How much code autocomplete should aim to predict, paired with guidance instructions."
+        },
+        "llembas.complete.instructions": {
+          "type": "string",
+          "default": "",
+          "description": "Custom instructions sent with autocomplete requests (e.g. style, brevity, or scope guidance)."
         },
         "llembas.rewrite.openDiff": {
           "type": "boolean",

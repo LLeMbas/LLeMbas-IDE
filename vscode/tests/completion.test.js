@@ -271,3 +271,31 @@ test('agent: a model not allowed for autocomplete is a refusal of its own', asyn
   assert.equal(await completer.ask({ prefix: 'a' }), null);
   assert.equal(refusals[0].reason, 'not_allowed');
 });
+
+test('prediction tokens slider, length presets and custom instructions flow into _lembas/complete', async () => {
+  const { resolvePrediction } = require('../src/completion');
+  assert.deepEqual(resolvePrediction({ length: 'auto', maxTokens: 0, instructions: '' }), { mode: 'auto', maxTokens: undefined, guidance: '' });
+  const words = resolvePrediction({ length: 'words' });
+  assert.equal(words.maxTokens, 24);
+  assert.match(words.guidance, /few words/i);
+  const fileOverride = resolvePrediction({ length: 'file', maxTokens: 1536, instructions: 'Use TypeScript types' });
+  assert.equal(fileOverride.maxTokens, 1536);
+  assert.match(fileOverride.guidance, /comprehensive continuation/i);
+  assert.match(fileOverride.guidance, /Use TypeScript types/);
+
+  const sent = [];
+  const c = new Completer({
+    request: (method, params) => {
+      sent.push({ method, params });
+      return Promise.resolve({ text: 'ok' });
+    },
+    notify: () => {},
+    maxTokens: () => 512,
+    length: () => 'block',
+    instructions: () => 'Keep code concise',
+  });
+  assert.equal(await c.ask({ prefix: 'function f() {' }, { manual: true }), 'ok');
+  assert.equal(sent[0].params.max_tokens, 512);
+  assert.equal(sent[0].params.context[0].path, 'llembas:autocomplete-instructions');
+  assert.match(sent[0].params.context[0].text, /Keep code concise/);
+});

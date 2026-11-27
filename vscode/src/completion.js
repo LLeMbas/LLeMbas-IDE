@@ -4,6 +4,40 @@
 
 const REFUSALS = new Set(['no_model', 'not_allowed', 'not_logged_in', 'unsupported']);
 
+const LENGTH_PRESETS = {
+  auto: { tokens: 0, instruction: '' },
+  words: {
+    tokens: 24,
+    instruction: 'Predict only a few words to finish the current expression or identifier. Stop immediately once the current token or phrase is complete.',
+  },
+  line: {
+    tokens: 64,
+    instruction: 'Predict at most the remainder of the current line. Do not start a new line.',
+  },
+  block: {
+    tokens: 256,
+    instruction: 'Predict a complete statement, block, or function body fitting the surrounding code.',
+  },
+  file: {
+    tokens: 2048,
+    instruction: 'Predict a comprehensive continuation, up to a full multi-function section or file implementation when appropriate.',
+  },
+};
+
+/** Resolve effective `max_tokens` and guidance instruction from user settings. */
+function resolvePrediction(o) {
+  const opts = o || {};
+  const mode = typeof opts.length === 'string' && Object.prototype.hasOwnProperty.call(LENGTH_PRESETS, opts.length) ? opts.length : 'auto';
+  const preset = LENGTH_PRESETS[mode];
+  const explicitTokens = Number.isFinite(Number(opts.maxTokens)) && Number(opts.maxTokens) > 0 ? Math.floor(Number(opts.maxTokens)) : 0;
+  const maxTokens = explicitTokens || preset.tokens || undefined;
+  const parts = [];
+  if (preset.instruction) parts.push(preset.instruction);
+  if (typeof opts.instructions === 'string' && opts.instructions.trim()) parts.push(opts.instructions.trim());
+  const guidance = parts.join('\n');
+  return { mode, maxTokens, guidance };
+}
+
 /** The text around the cursor that is sent: a window, not the file. */
 function windowAround(text, offset, limits) {
   const prefixMax = (limits && limits.prefixMax) || 12000;
@@ -28,6 +62,8 @@ class Completer {
    *           debounceMs?: () => number,
    *           model?: () => string | undefined,
    *           maxTokens?: () => number | undefined,
+   *           length?: () => string | undefined,
+   *           instructions?: () => string | undefined,
    *           onRefusal?: (reason: string, message: string, manual: boolean) => void,
    *           onError?: (message: string, manual: boolean) => void,
    *           setTimeout?: Function, clearTimeout?: Function, now?: () => number }} io
@@ -84,11 +120,17 @@ class Completer {
     if (what.cwd) params.cwd = what.cwd;
     if (what.sessionId) params.sessionId = what.sessionId;
     if (Array.isArray(what.open) && what.open.length) params.open = what.open;
-    if (Array.isArray(what.context) && what.context.length) params.context = what.context;
+    const pred = resolvePrediction({
+      maxTokens: this.io.maxTokens ? this.io.maxTokens() : undefined,
+      length: this.io.length ? this.io.length() : undefined,
+      instructions: this.io.instructions ? this.io.instructions() : undefined,
+    });
+    const ctx = Array.isArray(what.context) ? what.context.slice() : [];
+    if (pred.guidance) ctx.unshift({ path: 'llembas:autocomplete-instructions', text: pred.guidance });
+    if (ctx.length) params.context = ctx;
     const model = this.io.model ? this.io.model() : undefined;
     if (model) params.model = model;
-    const maxTokens = this.io.maxTokens ? this.io.maxTokens() : undefined;
-    if (maxTokens) params.max_tokens = maxTokens;
+    if (pred.maxTokens) params.max_tokens = pred.maxTokens;
     let asked;
     try {
       asked = Promise.resolve(this.io.request('_lembas/complete', params));
@@ -155,4 +197,4 @@ class Completer {
   }
 }
 
-module.exports = { Completer, windowAround, REFUSALS };
+module.exports = { Completer, windowAround, resolvePrediction, LENGTH_PRESETS, REFUSALS };

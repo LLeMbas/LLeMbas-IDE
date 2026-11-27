@@ -27,12 +27,13 @@ function M.selection(buf, first, last)
   return blocks
 end
 
---- The diagnostics on lines `first..last`, as one text; nil when there are none.
+--- The diagnostics on lines `first..last` (or the whole buffer when nil), as one text; nil when none.
 function M.diagnostics(buf, first, last)
   local out = {}
   for _, d in ipairs(vim.diagnostic.get(buf)) do
     local l = d.lnum + 1
-    if l >= first and l <= last and #out < 30 then
+    local in_range = (not first or not last) or (l >= first and l <= last)
+    if in_range and #out < 30 then
       local sev = vim.diagnostic.severity[d.severity] or "INFO"
       out[#out + 1] = ("- line %d, %s%s: %s"):format(l, sev:lower(), d.source and (" (" .. d.source .. ")") or "", (d.message:gsub("%s+", " ")))
     end
@@ -45,13 +46,15 @@ end
 function M.file(buf)
   local _, name = uri_of(buf)
   if not name then return nil end
-  local row = vim.api.nvim_win_get_cursor(0)[1]
+  local win = vim.fn.bufwinid(buf)
+  local row = win ~= -1 and vim.api.nvim_win_get_cursor(win)[1] or 1
   return { type = "text", text = ("Open in the editor: %s, cursor on line %d%s."):format(
     vim.fn.fnamemodify(name, ":."), row, vim.bo[buf].modified and " (the buffer has changes that are not saved)" or "") }
 end
 
---- The same as data, for an agent that takes it so (`_meta.lembas.editor`): the file, the cursor, and
---- with `first..last` the selection with its text and the diagnostics on it. Lines are 1-based, inclusive.
+--- The same as data, for an agent that takes it so (`_meta.lembas.editor`): the file, the cursor,
+--- diagnostics (selected lines, or buffer errors/warnings when nothing is selected), and open files.
+--- Lines are 1-based, inclusive.
 function M.editor(buf, first, last)
   local _, name = uri_of(buf)
   local out = {}
@@ -61,16 +64,41 @@ function M.editor(buf, first, last)
   if first and last then
     out.selection = { path = name, start = first, ["end"] = last,
       text = table.concat(vim.api.nvim_buf_get_lines(buf, first - 1, last, false), "\n") }
-    local diags = {}
-    for _, d in ipairs(vim.diagnostic.get(buf)) do
-      local l = d.lnum + 1
-      if l >= first and l <= last and #diags < 30 then
-        diags[#diags + 1] = { path = name, line = l, severity = (vim.diagnostic.severity[d.severity] or "INFO"):lower(),
-          message = (d.message:gsub("%s+", " ")), source = d.source }
+  end
+  local raw = vim.diagnostic.get(buf)
+  table.sort(raw, function(a, b)
+    if (a.severity or 9) ~= (b.severity or 9) then return (a.severity or 9) < (b.severity or 9) end
+    return (a.lnum or 0) < (b.lnum or 0)
+  end)
+  local diags = {}
+  for _, d in ipairs(raw) do
+    local l = d.lnum + 1
+    local keep
+    if first and last then
+      keep = l >= first and l <= last
+    else
+      keep = (d.severity or vim.diagnostic.severity.INFO) <= vim.diagnostic.severity.WARN
+    end
+    if keep and #diags < 20 then
+      diags[#diags + 1] = { path = name, line = l, severity = (vim.diagnostic.severity[d.severity] or "INFO"):lower(),
+        message = (d.message:gsub("%s+", " ")):sub(1, 300), source = d.source }
+    end
+  end
+  if #diags > 0 then out.diagnostics = diags end
+  local open = {}
+  local seen = {}
+  if name then seen[name] = true end
+  for _, b in ipairs(vim.api.nvim_list_bufs()) do
+    if #open >= 30 then break end
+    if b ~= buf and vim.api.nvim_buf_is_loaded(b) and vim.bo[b].buftype == "" then
+      local p = vim.api.nvim_buf_get_name(b)
+      if p ~= "" and not seen[p] then
+        seen[p] = true
+        open[#open + 1] = p
       end
     end
-    if #diags > 0 then out.diagnostics = diags end
   end
+  if #open > 0 then out.open = open end
   if next(out) == nil then return nil end
   return out
 end

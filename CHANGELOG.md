@@ -1,5 +1,36 @@
 # Changelog
 
+## [1.0.0-beta.4] — 2026-11-27
+
+### Fixed (VS Code / VSCodium & Neovim)
+
+- **Protocol compatibility with LLeMbas CLI 2.0:**
+  - `_lembas/files/search`: read `{ path, kind }` objects returned by the CLI (with string fallback) so `@file` search, `:LLeMbasFiles`, and *Add File / Open File* work reliably and distinguish files from directories while escaping spaces and `#`.
+  - `_lembas/sessions/resume`: replay the CLI's `historyTurns` shape (`role: "user" | "assistant"`, tool calls with outputs, thinking blocks, attachments, and harness turns), fixing empty transcripts on session resume.
+  - `_lembas/question`: send spec-compliant `Answer` objects (`{ kind: "options", labels }`, `{ kind: "custom", text }`, `{ kind: "skipped" }`) so answers are accepted instead of silently treated as dismissed; support `recommended` markers and multi-select in Neovim too.
+  - `_lembas/plan`: send `{ outcome: "dismissed" }` on dismissal.
+- **Neovim `:LLeMbasFix` & editor context:** include buffer error/warning diagnostics and open file paths in `_meta.lembas.editor` even when no visual range is selected, and read cursor position from the buffer's own window.
+- **VS Code `llembas.generate`:** guard against concurrent rewrites on the same file, show streaming progress with cancellation (`_lembas/edit/cancel`), and report when nothing changed or the document edited meanwhile.
+- **Neovim robustness:** cap JSON-RPC line buffer memory in `rpc.lua`, disable undo history on the read-only transcript buffer, reset session metadata (`title`, `progress`, `usage`, `team`, `attached`, `shown`) on `:LLeMbasNew`, handle `_lembas/permission/settled` and transient autocomplete errors cleanly, and read `M.version` directly from `VERSION`.
+
+### Added & Improved (VS Code / VSCodium)
+
+- **Redesigned chat sidebar UI & visual polish:**
+  - Two-row branded header with the LLeMbas pixel-leaf icon, live connection/working dot, mode indicator dot, session title, and compact action bar.
+  - Welcome empty state (*"Waybread for the code ahead."*) with quick-action starter buttons (`Explain selection`, `Fix file problems`, `Add @file`, `Resume session`) and shortcut hints.
+  - **Autocomplete Tune drawer** in the sidebar with an interactive **Max Tokens slider** (`0`..`4096`), quick length presets (`Default`, `Words`, `Line`, `Block`, `File`), **Prediction scope** selector (`llembas.complete.length`), **Autocomplete instructions** input (`llembas.complete.instructions`), and live toggles for *Suggest as you type* and *Show thinking*.
+  - Real **GFM Markdown tables** inside horizontally scrollable wrappers with column alignment and inline formatting, plus `~~strikethrough~~` and task list checkboxes (`- [x]` / `- [ ]`).
+  - **Fenced code block toolbars** with one-click **Copy** and **Insert at cursor** buttons.
+  - **Collapsible Thinking blocks** and **expandable tool call outputs** with semantic status icons, tool kind tags, execution duration (`ms`), and clickable file chips.
+  - Visual `<progress>` bar on live Plan cards, rich Markdown rendering inside Plan approval cards, live subagent team strip, session token usage indicator (`↑`/`↓`), auto-growing prompt input, and upgraded status bar item.
+  - New commands: `LLeMbas: Compact Session Context` (`llembas.compact`) and `LLeMbas: Toggle Autocomplete as You Type` (`llembas.toggleAutocomplete`).
+
+### Added & Improved (Neovim)
+
+- **Dedicated `LLeMbas*` highlight groups & visual design (`lua/llembas/ui.lua`):** colorscheme-aware highlights re-applied on `ColorScheme`, branded transcript winbar with session title/mode/model/token usage/phase, empty-state virtual-text welcome banner, section dividers, visual plan progress bar + task list, inline diff hint & gutter highlights, and floating preview windows.
+- **Autocomplete length, tokens & word-by-word accept:** `:LLeMbasAutocompleteTokens [N|auto|words|line|block|file]` and `:LLeMbasAutocompleteInstructions [text|-]`, plus `<M-Right>` (`accept_word`) to accept suggestions one word at a time.
+- **New commands & panel keys:** `:LLeMbasGenerate`, `:LLeMbasCompact`, `:LLeMbasCommands`, `:LLeMbasToggleThoughts`, `:LLeMbasCancelEdit`, `:LLeMbasNextHunk` / `:LLeMbasPrevHunk` (`]h`/`[h`), `:LLeMbasStatus`, `:LLeMbasHelp` (`g?`), `require("llembas").statusline()`, plus `K` (inspect tool output in a float), `y` (yank code block under cursor), `i` (jump to prompt), `<C-x><C-f>` (`@file`), `<C-x><C-o>` (`/command`), and configurable panel `position` (`right`, `left`, `bottom`, `float`).
+
 ## [1.0.0-beta.3] — 2026-11-26
 
 ### Fixed (VS Code / VSCodium)

@@ -440,3 +440,36 @@ test('a text file the agent shows goes to the hook that opens it', async (t) => 
   assert.equal(opened[0].text, '<script>alert(1)</script>');
   assert.match(text(chat), /> Shown: page\.html/);
 });
+
+test('real CLI shapes: files/search objects, historyTurns resume, question Answer[], plan dismissed, and compact', async (t) => {
+  const { chat } = fakeChat(t);
+  const files = await chat.searchFiles('src');
+  assert.deepEqual(files, [
+    { path: 'src/app.py', kind: 'file' },
+    { path: 'src/utils.py', kind: 'file' },
+    { path: 'src', kind: 'dir' },
+  ]);
+
+  assert.equal(await chat.resumeSession('ses_prev'), true);
+  assert.equal(chat.title, 'Earlier work');
+  assert.ok(chat.items.some((i) => i.kind === 'user' && i.text === 'earlier question'));
+  assert.ok(chat.items.some((i) => i.kind === 'tool' && i.title === 'read' && i.output === 'ok'));
+  assert.ok(chat.items.some((i) => i.kind === 'agent' && i.text === 'earlier answer'));
+
+  const qTurn = chat.send('QUESTION');
+  await until(() => chat.questions.size === 1);
+  const qItem = chat.items.find((i) => i.kind === 'question');
+  chat.answerQuestion(qItem.id, [{ kind: 'options', labels: ['SQLite'] }]);
+  await qTurn;
+  assert.match(text(chat), /"kind": "options".*"SQLite"/);
+
+  const pTurn = chat.send('PLANCARD');
+  await until(() => chat.planCards.size === 1);
+  const pItem = chat.items.find((i) => i.kind === 'plancard');
+  chat.answerPlan(pItem.id, 'dismissed');
+  await pTurn;
+  assert.match(text(chat), /"outcome": "dismissed"/);
+
+  assert.equal(await chat.compact(), true);
+  assert.match(text(chat), /> Session compacted: Compacted 2 turns\./);
+});

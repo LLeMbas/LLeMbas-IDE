@@ -12,13 +12,69 @@ function sentence(text) {
   return s ? s[0].toUpperCase() + s.slice(1) + (/[.!?…]$/.test(s) ? '' : '.') : '';
 }
 
+/** Normalize an entry from `_lembas/files/search` (`{ path, kind }` or plain string). */
+function normalizeFileEntry(entry) {
+  if (typeof entry === 'string') {
+    const clean = entry.replace(/\/$/, '');
+    return clean ? { path: clean, kind: entry.endsWith('/') ? 'dir' : 'file' } : null;
+  }
+  if (entry && typeof entry === 'object' && typeof entry.path === 'string' && entry.path) {
+    return { path: entry.path.replace(/\/$/, ''), kind: entry.kind === 'dir' ? 'dir' : 'file' };
+  }
+  return null;
+}
+
+/** Normalize one answer for `_lembas/question` to the harness spec's Answer shape. */
+function normalizeAnswer(a, question) {
+  if (a === null || a === undefined) return { kind: 'skipped' };
+  if (typeof a === 'object' && !Array.isArray(a) && typeof a.kind === 'string') {
+    if (a.kind === 'options' && Array.isArray(a.labels)) {
+      const labels = a.labels.map(String).filter(Boolean);
+      return labels.length ? { kind: 'options', labels } : { kind: 'skipped' };
+    }
+    if ((a.kind === 'custom' || a.kind === 'back') && typeof a.text === 'string') {
+      const text = a.text.trim();
+      return text ? { kind: a.kind, text } : { kind: 'skipped' };
+    }
+    if (a.kind === 'skipped') return { kind: 'skipped' };
+  }
+  if (Array.isArray(a)) {
+    const items = a.map(String).map((s) => s.trim()).filter(Boolean);
+    if (!items.length) return { kind: 'skipped' };
+    const known = new Set(((question && question.options) || []).map((o) => o.label));
+    if (known.size && items.every((l) => known.has(l))) return { kind: 'options', labels: items };
+    if (items.length === 1 && !known.has(items[0])) return { kind: 'custom', text: items[0] };
+    return { kind: 'options', labels: items };
+  }
+  const text = String(a).trim();
+  if (!text) return { kind: 'skipped' };
+  const known = new Set(((question && question.options) || []).map((o) => o.label));
+  if (known.has(text)) return { kind: 'options', labels: [text] };
+  return { kind: 'custom', text };
+}
+
+function summarizeAnswer(a) {
+  if (!a || a.kind === 'skipped') return 'Skipped';
+  if (a.kind === 'options') return (a.labels || []).join(', ');
+  if (a.kind === 'custom' || a.kind === 'back') return a.text || '';
+  return '';
+}
+
+function extractTextContent(content) {
+  return (Array.isArray(content) ? content : [])
+    .map((c) => (c && c.type === 'content' && c.content && c.content.type === 'text' ? c.content.text : c && c.type === 'text' ? c.text : ''))
+    .filter((t) => typeof t === 'string' && t)
+    .join('\n');
+}
+
 class Chat extends EventEmitter {
   /**
    * @param {{ makeAgent: (o: { cwd: string, onRequest: Function }) => import('./agent').Agent,
    *           cwd: () => string,
    *           options?: () => { mode?: string, model?: string, showThoughts?: boolean },
-   *           hooks?: { readTextFile?: Function, showDiffs?: Function, closeDiffs?: Function,
-   *                     showMedia?: Function, showText?: Function, filesChanged?: Function },
+   *           hooks?: { readTextFile?: Function, writeTextFile?: Function, showDiffs?: Function,
+   *                     closeDiffs?: Function, showMedia?: Function, showText?: Function,
+   *                     filesChanged?: Function },
    *           now?: () => number }} io
    * Events: `item (item)`, `reset`, `state`, `connected (agent)`, `stopped`, `editDelta (params)`, `stderr (text)`.
    */
@@ -43,7 +99,10 @@ class Chat extends EventEmitter {
     this.modes = [];
     this.mode = null;
     this.model = null;
+    this.title = '';
     this.progress = '';
+    this.usage = null;
+    this.team = null;
     this.commands = [];
     this.said = null;
     this.planItem = null;
@@ -70,22 +129,29 @@ class Chat extends EventEmitter {
     this.emit('item', item);
   }
 
-  note(text) {
+  note(text, level) {
     this.said = null;
-    return this.add({ kind: 'note', text: String(text) });
+    const item = { kind: 'note', text: String(text) };
+    if (level && level !== 'info') item.level = String(level);
+    return this.add(item);
   }
 
   /** What the view needs besides the items. */
   state() {
     return {
       busy: this.busy,
+      connected: !!(this.agent && this.agent.ready && !this.agent.stopped),
       session: !!this.session,
+      title: this.title,
       mode: this.mode,
       modes: this.modes.map((m) => ({ id: String(m.id), name: String(m.name || m.id) })),
       model: this.model,
       models: this.models.filter((m) => !Array.isArray(m.for) || m.for.includes('main')).map((m) => ({ id: String(m.id), name: String(m.name || m.id) })),
       progress: this.progress,
+      usage: this.usage,
+      team: this.team,
       canSteer: !!(this.session && this.has('steer')),
+      canCompact: !!(this.session && !this.busy && this.has('compact')),
       commands: this.commands,
     };
   }
@@ -116,12 +182,13 @@ class Chat extends EventEmitter {
       this.failedAt = 0;
       this.startError = null;
       this.emit('connected', agent);
+      this.emit('state');
       return agent;
     } catch (e) {
       if (this.agent === agent) this.agent = null;
       this.failedAt = this.now();
       this.startError = e.message;
-      if (!quiet) this.note(sentence(e.message));
+      if (!quiet) this.note(sentence(e.message), 'error');
       return null;
     }
   }
@@ -139,7 +206,7 @@ class Chat extends EventEmitter {
     for (const q of [...this.questions.values()]) this._settleQuestion(q, 'The agent stopped before this was answered.');
     for (const pl of [...this.planCards.values()]) this._settlePlan(pl, 'The agent stopped before this was answered.');
     this._clearSession();
-    if (e && e.started && had) this.note(`The agent stopped (${e.signal || 'exit ' + e.code})${e.last ? ': ' + e.last : '.'}`);
+    if (e && e.started && had) this.note(`The agent stopped (${e.signal || 'exit ' + e.code})${e.last ? ': ' + e.last : '.'}`, 'error');
     else if (!e && had) this.note('The agent was stopped. The next message starts a new session.');
     this.emit('stopped');
     this.emit('state');
@@ -183,7 +250,7 @@ class Chat extends EventEmitter {
       try {
         r = await agent.request('session/new', { cwd: this.io.cwd(), mcpServers: [], _meta: meta });
       } catch (e) {
-        if (this.agent === agent) this.note('No session: ' + sentence(e.message));
+        if (this.agent === agent) this.note('No session: ' + sentence(e.message), 'error');
         return false;
       }
       if (this.agent !== agent || !r || typeof r.sessionId !== 'string') return false;
@@ -224,11 +291,12 @@ class Chat extends EventEmitter {
         const r = await agent.request('session/prompt', promptParams(this.session, text, w.editor, agent.has('editor')));
         const lembas = (r && r._meta && r._meta.lembas) || {};
         if (typeof lembas.message === 'string' && lembas.message) this.note(lembas.message);
+        if (typeof lembas.summary === 'string' && lembas.summary) this.note('Compacted: ' + lembas.summary);
         if (r && r.stopReason && r.stopReason !== 'end_turn') {
           this.note(r.stopReason === 'cancelled' ? 'Stopped.' : 'The turn ended: ' + String(r.stopReason).replace(/_/g, ' ') + '.');
         }
       } catch (e) {
-        if (this.agent === agent) this.note('The turn failed: ' + sentence(e.message));
+        if (this.agent === agent) this.note('The turn failed: ' + sentence(e.message), 'error');
       }
       return true;
     } finally {
@@ -246,6 +314,15 @@ class Chat extends EventEmitter {
     if (!trimmed) return false;
     await this.agent.request('_lembas/steer', { sessionId: this.session, text: trimmed });
     this.add({ kind: 'user', text: trimmed, label: 'sent while working' });
+    return true;
+  }
+
+  /** Compact the session's conversation history (`_lembas/session/compact`). */
+  async compact() {
+    if (this.busy || !this.agent || !this.session) return false;
+    const r = await this.agent.request('_lembas/session/compact', { sessionId: this.session });
+    const summary = r && typeof r.summary === 'string' ? r.summary.trim() : '';
+    this.note(summary ? 'Session compacted: ' + summary : 'Session compacted.');
     return true;
   }
 
@@ -310,22 +387,25 @@ class Chat extends EventEmitter {
     const list = r && Array.isArray(r.commands) ? r.commands : [];
     this.commands = list
       .filter((c) => c && typeof c.name === 'string')
-      .map((c) => ({ name: String(c.name), description: String(c.description || ''), source: String(c.source || '') }));
+      .map((c) => ({
+        name: String(c.name),
+        description: String(c.description || ''),
+        hint: String((c.input && c.input.hint) || ''),
+        kind: String((c._meta && c._meta.lembas && c._meta.lembas.kind) || c.source || ''),
+      }));
     this.emit('state');
     return this.commands;
   }
 
-  /** Search the project's file index (`_lembas/files/search`). */
+  /** Search the project's file index (`_lembas/files/search`). Returns `{ path, kind }[]`. */
   async searchFiles(query, limit) {
     const agent = await this.connect(true);
     if (!agent || !agent.has('files')) return [];
-    if (!this.session && !(await this.ensureSession())) return [];
-    const r = await agent.request('_lembas/files/search', {
-      sessionId: this.session,
-      query: String(query || ''),
-      limit: limit || 30,
-    });
-    return r && Array.isArray(r.files) ? r.files.filter((f) => typeof f === 'string') : [];
+    const params = { query: String(query || ''), limit: limit || 30 };
+    if (this.session) params.sessionId = this.session;
+    else params.cwd = this.io.cwd();
+    const r = await agent.request('_lembas/files/search', params);
+    return (r && Array.isArray(r.files) ? r.files : []).map(normalizeFileEntry).filter(Boolean);
   }
 
   /** List previous sessions in this project (`_lembas/sessions/list`). */
@@ -346,27 +426,64 @@ class Chat extends EventEmitter {
     this.agent = agent;
     this.models = models;
     this.session = r.sessionId;
+    this.title = typeof r.title === 'string' ? r.title : '';
     const lembas = (r._meta && r._meta.lembas) || {};
     this.modes = (r.modes && Array.isArray(r.modes.availableModes) && r.modes.availableModes) || [];
     this.mode = (r.modes && r.modes.currentModeId) || lembas.mode || null;
     this.model = lembas.model || null;
     this.items = [];
+    const showThoughts = !!this.options().showThoughts;
     for (const turn of Array.isArray(r.turns) ? r.turns : []) {
-      if (turn && typeof turn.user === 'string' && turn.user.trim()) {
+      if (!turn || typeof turn !== 'object') continue;
+      if (turn.role === 'user') {
+        const att = Array.isArray(turn.attachments) && turn.attachments.length ? turn.attachments.map((a) => a.name).filter(Boolean).join(', ') : '';
+        const label = turn.machine ? 'harness' : att;
+        if ((typeof turn.text === 'string' && turn.text.trim()) || label) {
+          this.items.push({ id: 'i' + this.nextItem++, kind: 'user', text: String(turn.text || ''), label });
+        }
+        continue;
+      }
+      if (turn.role === 'assistant') {
+        if (showThoughts && typeof turn.reasoning === 'string' && turn.reasoning.trim()) {
+          this.items.push({ id: 'i' + this.nextItem++, kind: 'thought', text: turn.reasoning });
+        }
+        for (const t of Array.isArray(turn.tools) ? turn.tools : []) {
+          const out = typeof t.output === 'string' ? t.output : '';
+          this.items.push({
+            id: 'i' + this.nextItem++,
+            kind: 'tool',
+            toolCallId: String(t.id || 'h' + this.nextItem),
+            title: String(t.title || t.name || 'tool'),
+            toolKind: String(t.kind || ''),
+            status: t.isError ? 'failed' : 'completed',
+            output: out.length > DETAIL_MAX ? out.slice(0, DETAIL_MAX) + '\n…' : out,
+            files: [],
+            denied: false,
+          });
+        }
+        if (typeof turn.text === 'string' && turn.text.trim()) {
+          this.items.push({ id: 'i' + this.nextItem++, kind: 'agent', text: turn.text });
+        }
+        continue;
+      }
+      // Legacy combined shape fallback ({ user, assistant, tools })
+      if (typeof turn.user === 'string' && turn.user.trim()) {
         this.items.push({ id: 'i' + this.nextItem++, kind: 'user', text: turn.user, label: '' });
       }
-      for (const t of Array.isArray(turn && turn.tools) ? turn.tools : []) {
+      for (const t of Array.isArray(turn.tools) ? turn.tools : []) {
         this.items.push({
           id: 'i' + this.nextItem++,
           kind: 'tool',
           toolCallId: String(t.id || 'h' + this.nextItem),
           title: String(t.title || t.name || 'tool'),
+          toolKind: String(t.kind || ''),
           status: t.isError ? 'failed' : 'completed',
+          output: typeof t.output === 'string' ? t.output.slice(0, DETAIL_MAX) : '',
           files: [],
           denied: false,
         });
       }
-      if (turn && typeof turn.assistant === 'string' && turn.assistant.trim()) {
+      if (typeof turn.assistant === 'string' && turn.assistant.trim()) {
         this.items.push({ id: 'i' + this.nextItem++, kind: 'agent', text: turn.assistant });
       }
     }
@@ -411,9 +528,35 @@ class Chat extends EventEmitter {
       } else if (ev.type === 'mode' && typeof ev.mode === 'string') {
         this.mode = ev.mode;
         this.emit('state');
+      } else if (ev.type === 'title' && typeof ev.title === 'string') {
+        this.title = ev.title;
+        this.emit('state');
       } else if (ev.type === 'phase') {
         const p = ev.progress;
         this.progress = p && typeof p.phase === 'string' ? p.phase.replace(/_/g, ' ') + (p.detail ? ': ' + p.detail : '') : '';
+        this.emit('state');
+      } else if (ev.type === 'usage') {
+        const input = Number(ev.input_tokens ?? ev.input ?? ev.tokens_in ?? 0) || 0;
+        const output = Number(ev.output_tokens ?? ev.output ?? ev.tokens_out ?? 0) || 0;
+        if (input || output) {
+          this.usage = {
+            input: (this.usage ? this.usage.input : 0) + input,
+            output: (this.usage ? this.usage.output : 0) + output,
+          };
+          this.emit('state');
+        }
+      } else if (ev.type === 'tool_end' && typeof ev.id === 'string' && typeof ev.ms === 'number') {
+        const item = this.tools.get(ev.id);
+        if (item) {
+          item.ms = Math.max(0, Math.round(ev.ms));
+          this.changed(item);
+        }
+      } else if (ev.type === 'notice' && typeof ev.message === 'string' && ev.message.trim()) {
+        this.note(ev.message, ev.level || 'info');
+      } else if (ev.type === 'compacted' && typeof ev.summary === 'string' && ev.summary.trim()) {
+        this.note('Context compacted: ' + ev.summary);
+      } else if (ev.type === 'team') {
+        this.team = ev.tree || null;
         this.emit('state');
       }
     }
@@ -437,29 +580,35 @@ class Chat extends EventEmitter {
       let item = this.tools.get(id);
       const fresh = !item;
       if (!item) {
-        item = { kind: 'tool', toolCallId: id, title: 'tool', status: 'pending', files: [], denied: false };
+        item = { kind: 'tool', toolCallId: id, title: 'tool', toolKind: '', status: 'pending', files: [], output: '', denied: false };
         this.tools.set(id, item);
       }
       if (typeof u.title === 'string' && u.title) item.title = u.title;
+      if (typeof u.kind === 'string' && u.kind) item.toolKind = u.kind;
       if (typeof u.status === 'string') item.status = u.status;
       if (u._meta && u._meta.lembas && u._meta.lembas.denied) item.denied = true;
       const files = diffItems(u.content).map((d) => d.path);
       if (files.length) item.files = [...new Set(files)];
+      const textOut = extractTextContent(u.content);
+      if (textOut) item.output = textOut.length > DETAIL_MAX ? textOut.slice(0, DETAIL_MAX) + '\n…' : textOut;
       this.said = 'tool';
       if (fresh) this.add(item);
       else this.changed(item);
       if (item.status === 'completed' && item.files.length && this.hooks.filesChanged) this.hooks.filesChanged(item.files);
     } else if (kind === 'plan') {
       const entries = Array.isArray(u.entries) ? u.entries : [];
-      if (!entries.length) return;
+      const structured = (u._meta && u._meta.lembas && u._meta.lembas.plan) || null;
+      if (!entries.length && !structured) return;
       const done = entries.filter((e) => e && e.status === 'completed').length;
       const mapped = entries.map((e) => ({
         content: String((e && e.content) || ''),
         status: String((e && e.status) || 'pending'),
       }));
+      const title = structured && typeof structured.title === 'string' ? structured.title : '';
       if (!this.planItem || !this.items.includes(this.planItem)) {
-        this.planItem = this.add({ kind: 'plan', done, all: entries.length, entries: mapped });
+        this.planItem = this.add({ kind: 'plan', title, done, all: entries.length, entries: mapped });
       } else {
+        this.planItem.title = title;
         this.planItem.done = done;
         this.planItem.all = entries.length;
         this.planItem.entries = mapped;
@@ -473,7 +622,12 @@ class Chat extends EventEmitter {
       const list = Array.isArray(u.availableCommands) ? u.availableCommands : [];
       this.commands = list
         .filter((c) => c && typeof c.name === 'string')
-        .map((c) => ({ name: String(c.name), description: String(c.description || ''), source: '' }));
+        .map((c) => ({
+          name: String(c.name),
+          description: String(c.description || ''),
+          hint: String((c.input && c.input.hint) || ''),
+          kind: String((c._meta && c._meta.lembas && c._meta.lembas.kind) || ''),
+        }));
       this.emit('state');
     }
   }
@@ -502,15 +656,14 @@ class Chat extends EventEmitter {
       .filter((o) => o && typeof o.optionId === 'string')
       .map((o) => ({ optionId: o.optionId, name: String(o.name || o.optionId), kind: String(o.kind || '') }));
     const diffs = diffItems(call.content);
-    const text = (Array.isArray(call.content) ? call.content : [])
-      .map((c) => (c && c.type === 'content' && c.content && c.content.type === 'text' ? c.content.text : c && c.type === 'text' ? c.text : ''))
-      .filter((t) => typeof t === 'string' && t)
-      .join('\n');
+    const text = extractTextContent(call.content);
+    const subagent = lembas.subagent && typeof lembas.subagent.name === 'string' ? lembas.subagent.name : '';
     const item = this.add({
       kind: 'card',
       toolCallId: String(call.toolCallId || ''),
       title: String(call.title || lembas.tool || 'a tool'),
       tool: typeof lembas.tool === 'string' ? lembas.tool : '',
+      subagent,
       reason: typeof lembas.reason === 'string' ? lembas.reason : '',
       detail: text.length > DETAIL_MAX ? text.slice(0, DETAIL_MAX) + '\n…' : text,
       files: diffs.map((d) => d.path),
@@ -540,6 +693,7 @@ class Chat extends EventEmitter {
       options: (Array.isArray(q && q.options) ? q.options : []).map((o) => ({
         label: String((o && o.label) || ''),
         description: String((o && o.description) || ''),
+        recommended: !!(o && o.recommended),
       })),
     }));
     const item = this.add({
@@ -560,9 +714,10 @@ class Chat extends EventEmitter {
     const q = this.questions.get(cardId);
     if (!q) return false;
     this.questions.delete(cardId);
-    const list = Array.isArray(answers) ? answers.map((a) => (Array.isArray(a) ? a.map(String) : [String(a)])) : [];
+    const qs = q.item.questions || [];
+    const list = (Array.isArray(answers) ? answers : []).map((a, i) => normalizeAnswer(a, qs[i]));
     q.item.state = 'answered';
-    q.item.answer = list.map((a) => a.join(', ')).filter(Boolean).join(' · ') || 'Answered';
+    q.item.answer = list.map(summarizeAnswer).filter(Boolean).join(' · ') || 'Answered';
     this.changed(q.item);
     q.resolve({ outcome: 'answered', answers: list });
     return true;
@@ -616,10 +771,10 @@ class Chat extends EventEmitter {
       reply = { outcome: 'revise', feedback };
       label = feedback ? 'Revision requested: ' + feedback : 'Revision requested';
     } else {
-      reply = { outcome: 'dismiss' };
+      reply = { outcome: 'dismissed' };
       label = 'Dismissed';
     }
-    pl.item.state = outcome === 'dismiss' ? 'settled' : 'answered';
+    pl.item.state = outcome === 'dismiss' || outcome === 'dismissed' ? 'settled' : 'answered';
     pl.item.answer = label;
     this.changed(pl.item);
     pl.resolve(reply);
@@ -631,7 +786,7 @@ class Chat extends EventEmitter {
     pl.item.state = 'settled';
     pl.item.answer = why;
     this.changed(pl.item);
-    pl.resolve({ outcome: 'dismiss' });
+    pl.resolve({ outcome: 'dismissed' });
   }
 
   /** The person's answer to a card. */
@@ -677,7 +832,7 @@ class Chat extends EventEmitter {
       const got = await this.hooks.showMedia(p, (q) => agent.request('_lembas/show/read', q));
       if (!got || !got.ok) {
         const reason = (got && got.reason) || 'The file could not be shown.';
-        this.note(`${(got && got.name) || 'A file'} was not shown: ${reason}`);
+        this.note(`${(got && got.name) || 'A file'} was not shown: ${reason}`, 'warn');
         return { shown: false, reason };
       }
       this.add({ kind: 'media', name: got.name, size: got.size, picture: !!got.picture, src: got.src || '', key: got.key || '', opens: !!got.open });
@@ -715,4 +870,4 @@ function diffItems(content) {
   return out;
 }
 
-module.exports = { Chat, diffItems };
+module.exports = { Chat, diffItems, normalizeFileEntry, normalizeAnswer };

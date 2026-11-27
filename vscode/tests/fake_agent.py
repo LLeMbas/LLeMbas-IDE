@@ -327,7 +327,7 @@ def main():
                 entry[0].set()
         elif method == "initialize":
             meta = {} if PLAIN else {"lembas": {"protocol": 3, "harness_spec": "3.11.0", "limits": None, "connection": "example",
-                                                "capabilities": ["configure", "show", "editor", "media", "files", "commands", "steer", "sessions", "ask", "plan"]}}
+                                                "capabilities": ["configure", "show", "editor", "media", "files", "commands", "steer", "sessions", "ask", "plan", "compact"]}}
             result(msg, {"protocolVersion": 1, "agentCapabilities": {}, "agentInfo": {"name": "stand-in", "version": "0"}, "_meta": meta})
         elif method == "session/new":
             wanted = (msg["params"].get("_meta") or {}).get("model")
@@ -374,20 +374,31 @@ def main():
             pass
         elif method == "_lembas/files/search":
             q = str((msg.get("params") or {}).get("query") or "").lower()
-            sample = ["src/app.py", "src/utils.py", "README.md"]
-            result(msg, {"files": [f for f in sample if not q or q in f.lower()]})
+            sample = [
+                {"path": "src/app.py", "kind": "file"},
+                {"path": "src/utils.py", "kind": "file"},
+                {"path": "src", "kind": "dir"},
+                {"path": "README.md", "kind": "file"},
+            ]
+            result(msg, {"root": os.getcwd(), "files": [f for f in sample if not q or q in f["path"].lower()]})
         elif method == "_lembas/commands":
-            result(msg, {"commands": [{"name": "compact", "description": "Compact context", "source": "builtin"}]})
+            result(msg, {"commands": [{"name": "compact", "description": "Compact context", "_meta": {"lembas": {"kind": "builtin"}}}]})
+        elif method == "_lembas/session/compact":
+            result(msg, {"summary": "Compacted 2 turns."})
         elif method == "_lembas/steer":
-            result(msg, {"queued": True})
+            result(msg, {"queued": 1})
         elif method == "_lembas/sessions/list":
             result(msg, {"sessions": [{"id": "ses_prev", "title": "Earlier work", "model": "example/model-a", "updated": 1700000000000}]})
         elif method == "_lembas/sessions/resume":
             sid = (msg.get("params") or {}).get("sessionId") or "ses_prev"
             result(msg, {
                 "sessionId": sid,
+                "title": "Earlier work",
                 "modes": {"currentModeId": "edit", "availableModes": [{"id": "ask", "name": "Ask"}, {"id": "edit", "name": "Edit"}]},
-                "turns": [{"user": "earlier question", "assistant": "earlier answer", "tools": []}],
+                "turns": [
+                    {"role": "user", "text": "earlier question"},
+                    {"role": "assistant", "text": "earlier answer", "reasoning": "", "tools": [{"id": "t1", "name": "read", "args": "{}", "output": "ok"}]},
+                ],
                 "_meta": {"lembas": {"model": session_model[0], "mode": "edit"}},
             })
         elif "id" in msg:

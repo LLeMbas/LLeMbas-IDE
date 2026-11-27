@@ -70,7 +70,7 @@ test('activation registers the view, every command of the manifest, the provider
   assert.equal(s.inlineProviders.length, 1);
   assert.equal(s.lensProviders.length, 1);
   assert.ok(s.contentProviders.has('llembas-diff'));
-  assert.equal(s.statusItems[0].text, 'LLeMbas');
+  assert.equal(s.statusItems[0].text, '$(sparkle) LLeMbas');
   assert.equal(s.statusItems[0].command, 'llembas.modelSettings');
   assert.equal(view.webview.options.enableScripts, true);
   assert.equal(view.webview.options.enableCommandUris, false);
@@ -79,7 +79,11 @@ test('activation registers the view, every command of the manifest, the provider
   assert.deepEqual(view.posted[0], {
     type: 'reset',
     items: [],
-    state: { busy: false, session: false, mode: null, modes: [], model: null, models: [], progress: '', canSteer: false, commands: [] },
+    state: {
+      busy: false, connected: false, session: false, title: '', mode: null, modes: [], model: null, models: [],
+      progress: '', usage: null, team: null, canSteer: false, canCompact: false, commands: [],
+    },
+    settings: { auto: true, maxTokens: 0, length: 'auto', instructions: '', showThinking: false },
     attached: '',
   });
 });
@@ -316,7 +320,7 @@ test('autocomplete without a model: said once with a button, quiet until one is 
   s.picks.push((items) => items.find((i) => i.label === 'Only this window'));
   assert.equal(await ask(), undefined);
   assert.deepEqual(s.messages[0], { level: 'info', text: 'LLeMbas: No autocomplete model is chosen. Choose one in your settings on the server.', buttons: ['Choose a model'] });
-  await until(() => s.statusItems[0].text === 'LLeMbas: model-b');
+  await until(() => s.statusItems[0].text === '$(sparkle) LLeMbas: model-b');
   assert.match(s.statusItems[0].tooltip, /example\/model-b \(this window only\)/);
   assert.equal(s.messages.length, 1);
 
@@ -354,7 +358,7 @@ test('the two model settings: read, and saved in the account through the agent',
   s.picks.push((items) => items.find((i) => i.label === 'Save it'));
   await run('llembas.chooseAutocompleteModel');
   assert.deepEqual(sent().filter((m) => m.method === '_lembas/editor/settings').pop().params, { set: { autocomplete_model: 'example/model-b' } });
-  assert.equal(s.statusItems[0].text, 'LLeMbas: model-b');
+  assert.equal(s.statusItems[0].text, '$(sparkle) LLeMbas: model-b');
 
   s.picks.push((items) => items[items.length - 1]);
   await run('llembas.chooseAutocompleteModel');
@@ -651,44 +655,71 @@ test('a command that is not installed is said in the chat, and autocomplete stay
 });
 
 test('full agentic features: question & plan cards, session resume, @file search, open file:line, and mid-run steer', async (t) => {
-  const { view, sent, run, items, state, idle, dir, s } = host(t);
+  const { vscode, view, sent, run, items, state, idle, dir, s } = host(t);
   fs.writeFileSync(path.join(dir, 'README.md'), 'line 1\nline 2\nline 3\n');
 
-  // 1. Question card
+  // 1. Question card (real CLI Answer[] shape)
   view.say({ type: 'send', text: 'QUESTION' });
   await until(() => items().some((i) => i.kind === 'question' && i.state === 'open'));
   const qCard = items().find((i) => i.kind === 'question');
-  view.say({ type: 'answerQuestion', card: qCard.id, answers: [['SQLite']] });
+  view.say({ type: 'answerQuestion', card: qCard.id, answers: [{ kind: 'options', labels: ['SQLite'] }] });
   await idle();
   const qReply = items().filter((i) => i.kind === 'agent').pop();
   assert.ok(JSON.stringify(qReply.ast).includes('SQLite'));
+  assert.ok(JSON.stringify(qReply.ast).includes('options'));
 
-  // 2. Plan approval card
+  // 2. Plan approval card (rendered as safe Markdown AST)
   view.say({ type: 'send', text: 'PLANCARD' });
   await until(() => items().some((i) => i.kind === 'plancard' && i.state === 'open'));
   const pCard = items().find((i) => i.kind === 'plancard');
+  assert.ok(Array.isArray(pCard.ast) && pCard.ast.length > 0);
   view.say({ type: 'answerPlan', card: pCard.id, outcome: 'approve', value: 'edit' });
   await idle();
   const pReply = items().filter((i) => i.kind === 'agent').pop();
   assert.ok(JSON.stringify(pReply.ast).includes('approve'));
 
-  // 3. @file index search & bringing up a specific file at a line
+  // 3. @file index search ({ path, kind } real CLI shape) & bringing up a specific file at a line
   view.say({ type: 'searchFiles', query: 'app', seq: 7 });
   await until(() => view.posted.some((m) => m.type === 'files' && m.seq === 7));
   const found = view.posted.find((m) => m.type === 'files' && m.seq === 7);
-  assert.deepEqual(found.files, ['src/app.py']);
+  assert.deepEqual(found.files, [{ path: 'src/app.py', kind: 'file' }]);
 
   view.say({ type: 'openFile', path: 'README.md', line: 2, soft: true });
   await until(() => s.executed.some((e) => e[0] === 'showTextDocument'));
 
-  // 4. Session resume replays history
+  // 4. Session resume replays history (real CLI role-based historyTurns)
   s.picks.push((list) => list.find((x) => x.id === 'ses_prev'));
   await run('llembas.resumeSession');
   assert.equal(state().mode, 'edit');
+  assert.equal(state().title, 'Earlier work');
   assert.ok(items().some((i) => i.kind === 'user' && i.text === 'earlier question'));
   assert.ok(items().some((i) => i.kind === 'agent'));
 
-  // 5. Mid-run steer & live mode switch while busy
+  // 5. Compact session & webview settings drawer (autocomplete tokens slider + length + instructions)
+  await run('llembas.compact');
+  assert.ok(items().some((i) => i.kind === 'note' && i.text.includes('Compacted 2 turns')));
+
+  view.say({ type: 'updateSettings', settings: { maxTokens: 512, length: 'block', instructions: 'Use strict types' } });
+  await until(() => s.config['llembas.complete.maxTokens'] === 512);
+  assert.equal(s.config['llembas.complete.length'], 'block');
+  assert.equal(s.config['llembas.complete.instructions'], 'Use strict types');
+
+  // Verify updated tokens + instructions actually go out on _lembas/complete
+  s.config['llembas.complete.debounce'] = 5;
+  const ed = vscode.__.open(path.join(dir, 'tune.py'), 'def f():\n    ', new vscode.Selection(1, 4, 1, 4), 'python');
+  await s.inlineProviders[0].provideInlineCompletionItems(ed.document, new vscode.Position(1, 4), { triggerKind: 0 }, { isCancellationRequested: false, onCancellationRequested: () => ({ dispose() {} }) });
+  const compCall = sent().filter((m) => m.method === '_lembas/complete').pop();
+  assert.equal(compCall.params.max_tokens, 512);
+  assert.equal(compCall.params.context[0].path, 'llembas:autocomplete-instructions');
+  assert.match(compCall.params.context[0].text, /Use strict types/);
+
+  // 6. Toggle autocomplete & copyCode
+  await run('llembas.toggleAutocomplete');
+  assert.equal(s.config['llembas.complete.auto'], false);
+  view.say({ type: 'copyCode', text: 'const x = 1;' });
+  await until(() => s.copied === 'const x = 1;');
+
+  // 7. Mid-run steer & live mode switch while busy
   view.say({ type: 'send', text: 'SLOW' });
   await until(() => state().busy === true);
   view.say({ type: 'steer', text: 'focus on tests' });
