@@ -37,6 +37,7 @@ function chatHtml(o) {
 <title>LLeMbas</title>
 </head>
 <body>
+<div class="chrome">
 <header class="bar">
   <div class="bar-top">
     <div class="brand">
@@ -92,6 +93,7 @@ function chatHtml(o) {
   </div>
 </section>
 <div id="team-bar" class="team-bar" hidden aria-live="polite"></div>
+</div>
 <main id="log" aria-live="polite">
   <section id="empty" class="empty">
     <div class="hero">

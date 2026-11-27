@@ -1,5 +1,11 @@
 # Changelog
 
+## [1.0.0-beta.5] — 2026-11-27
+
+### Fixed (VS Code / VSCodium)
+
+- **Chat input pinned to the bottom of the side panel.** Wrapped the header, collapsible Tune drawer, and subagent strip inside a single `.chrome` container and restored a 3-row `body` grid (`auto minmax(0, 1fr) auto`) with `height: 100vh`. Previously, `hidden` (`display: none`) siblings shifted `<main id="log">` and `<footer>` onto `auto` tracks above an empty `1fr` track, floating the chat composer near the top with empty space beneath it.
+
 ## [1.0.0-beta.4] — 2026-11-27
 
 ### Fixed (VS Code / VSCodium & Neovim)

@@ -17,7 +17,7 @@ local function read_repo_version()
       if v ~= "" then return v end
     end
   end
-  return "1.0.0-beta.4"
+  return "1.0.0-beta.5"
 end
 
 M.config = {

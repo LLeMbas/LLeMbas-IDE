@@ -327,6 +327,12 @@ test('the page: a strict policy, one script with a nonce, nothing from elsewhere
   });
   assert.ok(multi.includes('style-src vscode-resource: https://file+.vscode-resource.vscode-cdn.net;'));
   assert.throws(() => chatHtml({ cspSource: "https://a.example; script-src 'unsafe-inline'", nonce: 'abc', scriptUri: 's', styleUri: 't' }));
+  // Layout invariant: body has exactly 3 visible top-level grid children (.chrome, #log, footer)
+  // so hiding collapsible drawers inside .chrome never shifts #log or footer off their grid tracks.
+  const body = /<body>([\s\S]*)<\/body>/.exec(html)[1];
+  assert.match(body, /^\s*<div class="chrome">[\s\S]*<\/div>\s*<main id="log"[\s\S]*<\/main>\s*<footer>[\s\S]*<\/footer>\s*<script\b/);
+  const css = fs.readFileSync(path.join(__dirname, '..', 'media', 'chat.css'), 'utf8');
+  assert.match(css, /grid-template-rows:\s*auto minmax\(0,\s*1fr\) auto;/);
 });
 
 test('the stylesheet takes every colour from the editor\'s theme', () => {

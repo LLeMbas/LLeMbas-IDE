@@ -697,7 +697,7 @@ test('full agentic features: question & plan cards, session resume, @file search
 
   // 5. Compact session & webview settings drawer (autocomplete tokens slider + length + instructions)
   await run('llembas.compact');
-  assert.ok(items().some((i) => i.kind === 'note' && i.text.includes('Compacted 2 turns')));
+  await until(() => items().some((i) => i.kind === 'note' && i.text.includes('Compacted 2 turns')));
 
   view.say({ type: 'updateSettings', settings: { maxTokens: 512, length: 'block', instructions: 'Use strict types' } });
   await until(() => s.config['llembas.complete.maxTokens'] === 512);
